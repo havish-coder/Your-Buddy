@@ -105,10 +105,22 @@
   }
 
   var SHOW_OPEN = "<show>";
+  var NOTES_OPEN = "<notes>";
+
+  /** Remove every <notes>...</notes> block (an unclosed one runs to the end); unless `final`, hold back a dangling "<no" tail. */
+  function stripNotes(text, final) {
+    var t = String(text == null ? "" : text).replace(/<notes>[\s\S]*?(<\/notes>|$)/gi, "");
+    if (!final) {
+      for (var k = Math.min(NOTES_OPEN.length - 1, t.length); k >= 1; k--) {
+        if (NOTES_OPEN.indexOf(t.slice(-k).toLowerCase()) === 0) { t = t.slice(0, t.length - k); break; }
+      }
+    }
+    return t;
+  }
 
   /** Split reply text into spoken part and show part. `final` false holds back a dangling "<sh" tail. */
   function splitReply(text, final) {
-    var t = String(text == null ? "" : text).replace(/^\s+/, "");
+    var t = stripNotes(text, final).replace(/^\s+/, "");
     var m = /<show>/i.exec(t);
     var say, show = "", hasShow = false, closed = false;
     if (m) {
@@ -428,7 +440,9 @@
     }
 
     function barText() {
-      return BARS[Math.min(3, Math.max(1, Math.round(config.assertiveness) || 2))];
+      var r = Math.round(config.assertiveness);
+      if (isNaN(r)) r = 2;
+      return BARS[Math.min(3, Math.max(1, r))];
     }
 
     function isStepMode(mode) { return mode === "listen" || mode === "strict" || mode === "monitor"; }
@@ -456,6 +470,12 @@
           "question back to them. Four sentences at most.";
       }
       if (mode === "monitor") {
+        if (Math.round(config.assertiveness) === 0) {
+          return "[PAUSED: LISTEN MODE]\n\nYour private notes so far: " + n + "\n\nWhat they said:\n" + utt + "\n\n" +
+            "They paused. Stay quiet by answering with only <notes>...</notes> (your updated private thinking, under 60 words) " +
+            "unless they have asked you something directly. Never correct them or point out mistakes. If they did ask, answer " +
+            "in spoken words, in four sentences at most.";
+        }
         return "[PAUSED: LISTEN MODE]\n\nYour private notes so far: " + n + "\n\nWhat they said:\n" + utt + "\n\n" +
           "They paused. Stay quiet by answering with only <notes>...</notes> (your updated private thinking, under 60 words) " +
           "unless they have gone wrong by this bar: " + barText() + " or they have asked you something directly. In that case " +
@@ -595,7 +615,7 @@
         settled: false,
         userCommitted: false,
         rs: null,
-        images: mode === "listen" || mode === "strict" ? [] : pendingImages(),
+        images: mode === "listen" || mode === "strict" || mode === "monitor" ? [] : pendingImages(),
       };
       var utt = utteranceText();
       if (ask.cutIn) {
@@ -635,7 +655,8 @@
       var t = String(text == null ? "" : text).replace(/^\s+/, "");
       if (!t) return "undecided";
       var l = t.toLowerCase();
-      if (l.indexOf("<notes>") === 0) return "notes";
+      var ni = l.indexOf("<notes>");
+      if (ni >= 0 && ni < 40) return "notes";
       if (l.length < 7 && "<notes>".indexOf(l) === 0) return "undecided";
       if (/^<wait\s*\/?>/.test(l)) return "quiet";
       if (l.length < 6 && "<wait>".indexOf(l) === 0) return "undecided";
@@ -648,9 +669,20 @@
     }
 
     /** End of the first sentence with no minimum length (a stopper like "Stop." counts), or -1. */
-    function stopperEnd(say) {
+    function stopperEnd(say, ended) {
       var m = /[.!?\u2026]["'\u201d\u2019)\]]*(?=\s|$)/.exec(say);
-      return m ? m.index + m[0].length : -1;
+      if (!m) return -1;
+      var e = m.index + m[0].length;
+      if (e < say.length || ended) return e;
+      // At the very end of text still arriving: only a short digit-free stopper is safe ("Stop."), not "3." of "3.14".
+      var words = say.slice(0, e).trim().split(/\s+/).length;
+      return words <= 3 && !/\d/.test(say.slice(0, e)) ? e : -1;
+    }
+
+    /** A bare interjection that can only be a cut-in ("Stop.", "No, wait."), safe to speak before more text arrives. */
+    function isStopperWord(sentence) {
+      var w = String(sentence).toLowerCase().replace(/[^a-z ]+/g, " ").replace(/\s+/g, " ").trim();
+      return /^(stop|wait|no|nope|whoa|hold on|hold up|hold it|hang on|no wait|wait a (second|moment|minute))$/.test(w);
     }
 
     function setNotes(text) {
@@ -668,7 +700,9 @@
       if (isStepMode(ask.mode)) {
         if (classifyStep(ask.text) !== "cut") return;
         var ss = splitReply(ask.text, false);
-        if (ask.cutIn ? stopperEnd(ss.say) >= 0 : firstSentenceEnd(ss.say) >= 0) beginCommit(ask);
+        var se = ask.cutIn ? stopperEnd(ss.say, false) : firstSentenceEnd(ss.say);
+        // Under 40 characters a <notes> tag may still arrive: commit early only with more text after the sentence.
+        if (se >= 0 && (ask.text.trim().length >= 40 || ss.say.slice(se).trim() || isStopperWord(ss.say.slice(0, se)))) beginCommit(ask);
         return;
       }
       if (classifyReply(ask.text) !== "speech") return;
@@ -707,7 +741,11 @@
     /** A listening, strict or monitor step finished without committing a cut-in. */
     function onStepDone(ask) {
       var c = classifyStep(ask.text);
-      if (c === "cut") { beginCommit(ask); return; }
+      if (c === "cut") {
+        var sd = splitReply(ask.text, true);
+        if (sd.say.trim() || sd.show.trim()) { beginCommit(ask); return; }
+        c = /<notes>/i.test(ask.text) ? "notes" : "quiet";
+      }
       release(ask);
       var fresh = c === "notes" ? extractNotes(ask.text) : "";
       if (fresh) setNotes(fresh);
@@ -860,7 +898,7 @@
         rs.noSpeak = true;
         rs.forceIdle = true;
         notice("voice_failed", "The microphone didn't close, so the reply stays on screen. Tap to talk again.", { reason: "mic_not_closed" });
-      } else if (rs.kind === "reply" && !ask.userCommitted && !ask.err && version !== v0) {
+      } else if (rs.kind === "reply" && ask.mode !== "monitor" && !ask.userCommitted && !ask.err && version !== v0) {
         // The user was still talking while the mic closed and it can't reopen without a tap:
         // abandon this ask and ask again, forced, with the whole utterance.
         ask.dead = true;
@@ -973,6 +1011,7 @@
         rs.turn.show = show;
         emit({ type: "turnUpdate", turn: Object.assign({}, rs.turn) });
       }
+      if (rs.kind === "cutIn" && ask.ended && !ask.err) { var cn = extractNotes(ask.text); if (cn) setNotes(cn); }
       if (ask.ended && !ask.err && !ask.settled) settle(ask, "speak", turnText.slice(0, 80), rs.commitMs);
 
       var voiceActive = speakAllowed() && !rs.voiceFailed && !rs.noSpeak && !ask.err;
@@ -985,7 +1024,7 @@
       }
       if (voiceActive) {
         if (!rs.lines.length) {
-          var fe = rs.kind === "cutIn" ? stopperEnd(say) : firstSentenceEnd(say); // a cut-in speaks its stopper first
+          var fe = rs.kind === "cutIn" ? stopperEnd(say, ask.ended) : firstSentenceEnd(say); // a cut-in speaks its stopper first
           if (fe >= 0) {
             rs.consumed = fe;
             splitLines(say.slice(0, fe), MAX_LINE_CHARS).forEach(function (p, i) { issue(rs, p, i === 0); });

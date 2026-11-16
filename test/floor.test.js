@@ -3137,3 +3137,112 @@ test("L13 defaults of the rework", () => {
   assert.strictEqual(DEFAULTS.minWordsForCutIn, undefined);
   assert.strictEqual(DEFAULTS.cutInMinGapMs, undefined);
 });
+
+// ---------------------------------------------------------- review fixes: notes, stoppers, listen mode
+async function stepStream(chunks, cfg) {
+  const t = lis(cfg);
+  t.eng.takeFloor();
+  feed(t, nw(8));
+  const c = t.model.calls[0];
+  let acc = "";
+  for (const ch of chunks) { acc += ch; c.chunk(acc); await flush(); }
+  c.resolve(acc);
+  for (let i = 0; i < 3; i++) { await t.clock.advance(10); t.voice.finishAll(); }
+  return t;
+}
+const assistantTurns = (t) => t.ev("turn").filter((e) => e.turn.role === "assistant").map((e) => e.turn.text);
+
+test("L14a a step with words before <notes> is notes: nothing spoken, no cut-in, no turn, notes updated", async () => {
+  for (const chunks of [["Okay. <notes>claims X; shaky</notes>"], ["Okay.", " <notes>claims X; shaky</notes>"], ["Okay. <no", "tes>claims X; shaky</notes>"]]) {
+    const t = await stepStream(chunks);
+    assert.deepStrictEqual(t.voice.spoken(), []);
+    assert.strictEqual(t.ev("cutIn").length, 0);
+    assert.deepStrictEqual(assistantTurns(t), []);
+    assert.strictEqual(t.eng.getInfo().notes, "claims X; shaky");
+  }
+});
+
+test("L14b a cut-in followed by a notes block speaks and shows only the spoken sentences and keeps the notes", async () => {
+  const t = await stepStream(["Stop. That's wrong. Why?", " <notes>they said X</notes>"]);
+  assert.strictEqual(t.voice.spoken().join(" "), "Stop. That's wrong. Why?");
+  assert.deepStrictEqual(assistantTurns(t), ["Stop. That's wrong. Why?"]);
+  assert.strictEqual(t.ev("cutIn").length, 1);
+  assert.strictEqual(t.eng.getInfo().notes, "they said X");
+});
+
+test("L14c an unclosed notes block after a cut-in is not spoken", async () => {
+  const t = await stepStream(["Stop. That's wrong. Why?", " <notes>they said X and more"]);
+  assert.strictEqual(t.voice.spoken().join(" "), "Stop. That's wrong. Why?");
+  assert.deepStrictEqual(assistantTurns(t), ["Stop. That's wrong. Why?"]);
+  assert.strictEqual(t.eng.getInfo().notes, "they said X and more");
+});
+
+test("L15 a stopper does not commit mid-sentence; a real stopper still commits at once", async () => {
+  const t = await stepStream(["No, it's 3.", "14 seconds. Check it?"]);
+  assert.deepStrictEqual(t.voice.spoken(), ["No, it's 3.14 seconds.", "Check it?"]);
+  const u = lis();
+  u.eng.takeFloor();
+  feed(u, nw(8));
+  const c = u.model.calls[0];
+  c.chunk("Stop."); await flush();
+  assert.strictEqual(u.ev("cutIn").length, 1, "a real stopper commits at once");
+  assert.strictEqual(u.voice.spoken()[0], "Stop.");
+  const v = lis();
+  v.eng.takeFloor();
+  feed(v, nw(8));
+  v.model.calls[0].chunk("Okay."); await flush();
+  assert.strictEqual(v.ev("cutIn").length, 0, "a non-stopper sentence waits for more text, which may be notes");
+  v.model.calls[0].chunk("Okay. That's wrong."); await flush();
+  assert.strictEqual(v.ev("cutIn").length, 1);
+});
+
+test("L16 listen mode: a monitor reply is not abandoned for a forced ask when words arrive while the mic closes", async () => {
+  const t = setup({ mode: "listen", pauseMs: 600 });
+  t.eng.takeFloor();
+  t.mic.final("what is the capital of france");
+  await t.clock.advance(700);
+  const m = t.model.byMode("monitor")[0];
+  t.mic.lateWords.push("and also spain");
+  m.chunk("The capital of France is Paris. "); await t.clock.advance(10);
+  m.resolve("The capital of France is Paris. Spain's is Madrid."); await t.clock.advance(10);
+  t.voice.finishAll(); await t.clock.advance(10);
+  assert.strictEqual(t.model.calls.length, 1);
+  assert.deepStrictEqual(t.voice.spoken(), ["The capital of France is Paris.", "Spain's is Madrid."]);
+  const user = t.ev("turn").filter((e) => e.turn.role === "user").map((e) => e.turn.text).join(" ");
+  assert.match(user, /and also spain/);
+});
+
+test("L17 listen mode with assertiveness 0: the monitor prompt has no bar and says to stay quiet unless asked directly", async () => {
+  const t = setup({ mode: "listen", pauseMs: 600, assertiveness: 0 });
+  t.eng.takeFloor();
+  t.mic.final("the moon is made of cheese");
+  await t.clock.advance(700);
+  const last = t.model.byMode("monitor")[0].last;
+  assert.doesNotMatch(last, /factual error|questionable|unsupported/);
+  assert.match(last, /unless they have asked you something directly/);
+  assert.match(last, /Never correct/);
+  const u = setup({ mode: "listen", pauseMs: 600, assertiveness: 2 });
+  u.eng.takeFloor();
+  u.mic.final("the moon is made of cheese");
+  await u.clock.advance(700);
+  assert.match(u.model.byMode("monitor")[0].last, /factual error/);
+});
+
+test("L18 a pending image is not sent with a monitor step, and is sent with the next reply", async () => {
+  const t = setup({ mode: "listen", pauseMs: 600 });
+  const blob = { fake: "blob" };
+  t.eng.addAttachment({ kind: "image", name: "pic.png", blob });
+  await flush();
+  t.model.calls[0].resolve("A heron.");
+  await flush();
+  t.eng.takeFloor();
+  t.mic.final("what is in the picture");
+  await t.clock.advance(700);
+  const m = t.model.byMode("monitor")[0];
+  assert.strictEqual(m.opts.images, undefined);
+  m.resolve("<notes>asks about the picture</notes>");
+  await flush();
+  t.eng.submitText("please answer");
+  await flush();
+  assert.deepStrictEqual(t.model.last().opts.images, [blob]);
+});
