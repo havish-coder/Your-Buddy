@@ -1,0 +1,11 @@
+Team sync notes - Tuesday
+1. Reviewed the sprint board; two tickets moved to done.
+2. Agreed to push the release to next Thursday.
+3. Reference code for the vendor escalation is PELICAN-7421.
+4. Alice will draft the onboarding checklist by Friday.
+5. Build pipeline was slow again; Ben is looking at the cache config.
+6. Customer feedback: the export button is hard to find.
+7. Budget review moved to the first week of next month.
+8. Action: confirm the test environment credentials with ops.
+9. Next sync is at 10:00 in the small meeting room.
+10. Parking lot: revisit the logging format after launch.
