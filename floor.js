@@ -32,7 +32,6 @@
     echoGuard: true,
     echoTailMs: 1500,
     fillers: ["um", "uh", "er", "erm", "ah", "hmm", "mm", "uhm"],
-    mixedMinWords: 3,
     phraseFilterMs: 2500,
     cutInGraceMs: 1200,
     backchannels: ["yeah", "yep", "yes", "mm", "mhm", "mm-hm", "uh-huh", "right", "ok", "okay", "sure", "i see", "got it"],
@@ -263,7 +262,9 @@
     var droppedGuess = false; // the live guess was withdrawn ("" with no final): not part of the utterance
     var promptTrimNoticed = false;
     // full duplex (config.duplex): echo filtering and barge-in
-    var echoTail = null;      // {until, keys}: Claude's last words, ignored for echoTailMs after the voice stops
+    var echoTail = null;      // {until}: speakers only; the mic is deaf until then (echoTailMs after the voice stops)
+    var dropState = null;     // speakers: {at, settled}: a phrase whose partial was dropped; its rest and final are dropped too
+    var speakersNoted = false; // the "speakers" ignored decision was already emitted for this deaf window
     var pf = null;            // per-phrase references: {committed, frozen, at}
     var graceCarry = [];      // words said during a cut-in's grace period, carried into a barge-in utterance
     var held = [];            // lone ordinary-word finals heard while Claude spoke: start of the next utterance
@@ -1225,8 +1226,8 @@
     }
 
     function noteEchoTail(rs) {
-      if (!config.duplex || config.echoGuard === false || !rs || rs.resume || !rs.lines.length) return;
-      echoTail = { until: now() + Number(config.echoTailMs || 0), seq: keySeq(rs.lines.map(function (l) { return l.text; })) };
+      if (!config.duplex || config.echoGuard === false || !rs || !rs.lines.length) return;
+      echoTail = { until: now() + Number(config.echoTailMs || 0) };
     }
 
     function flushHeld() {
@@ -1236,45 +1237,15 @@
       utteranceChanged();
     }
 
-    /** Reference lists (ordered loose keys): the voice's words (speakers only), then the phrase's committed/frozen text. */
+    /** Reference lists (ordered loose keys): the phrase's committed/frozen text (words already in the utterance). */
     function buildRefs() {
       var refs = [];
-      if (config.echoGuard !== false) {
-        if (reply && !reply.resume && reply.lines.length) refs.push(keySeq(reply.lines.map(function (l) { return l.text; })));
-        if (echoTail && now() < echoTail.until) refs.push(echoTail.seq);
-      }
       var ph = curPf();
       if (ph) {
         if (ph.committed) refs.push(ph.committed);
         if (ph.frozen) ph.frozen.forEach(function (r) { refs.push(r); });
       }
       return refs.filter(function (r) { return r.length; });
-    }
-
-    /** Word index within the current reply's spoken words that the voice has reached (the cut-off's estimate). */
-    function spokenWordIndex(rs) {
-      var pos = rs.pos;
-      if (!pos || !rs.lines.length) return 0;
-      var idx = -1;
-      if (pos.id != null) for (var i = 0; i < rs.lines.length; i++) if (rs.lines[i].id === pos.id) idx = i;
-      if (idx < 0) idx = Math.min(Math.max(0, pos.line | 0), rs.lines.length - 1);
-      var n = 0;
-      for (var k = 0; k < idx; k++) n += tokens(rs.lines[k].text).length;
-      var inLine = Math.floor((pos.ms || 0) / 1000 * config.wordsPerMinute * rs.rate / 60);
-      return n + Math.min(Math.max(0, inLine), tokens(rs.lines[idx].text).length);
-    }
-
-    /** Is this stop word/phrase what the voice is saying right now (about 10 words back to 5 ahead)? */
-    function nearSpeaking(words) {
-      var rs = reply;
-      if (!rs || rs.resume || !rs.lines.length) return false;
-      var ref = keySeq(rs.lines.map(function (l) { return l.text; }));
-      var p = spokenWordIndex(rs);
-      var win = ref.slice(Math.max(0, p - 10), p + 5);
-      var keys = words.map(looseKey);
-      return win.some(function (x, i) {
-        return keys.every(function (k, j) { return i + j < win.length && wordMatch(k, win[i + j]); });
-      });
     }
 
     /**
@@ -1377,6 +1348,22 @@
      * (possibly filtered) text for the normal path.
      */
     function duplexIncoming(kind, raw) {
+      if (config.echoGuard !== false) {
+        // Speakers: deaf while Claude thinks or speaks and for echoTailMs after; a phrase begun in that window stays dropped.
+        var deaf = ((state === "thinking" || state === "speaking") && micOpen()) || (echoTail && now() < echoTail.until);
+        var ds = dropState && now() - dropState.at <= Number(config.phraseFilterMs || 0) ? dropState : null;
+        if (ds && kind === "partial" && ds.settled) ds = null; // a new phrase after the old one settled
+        dropState = ds;
+        if (deaf || ds) {
+          if (!speakersNoted) {
+            speakersNoted = true;
+            emit({ type: "decision", kind: "bargeIn", result: "ignored", ms: 0, detail: "speakers" });
+          }
+          dropState = kind === "final" ? null : { at: now(), settled: false };
+          return null;
+        }
+        speakersNoted = false;
+      }
       var ph = curPf();
       if (ph) ph.at = now();
       var all = tokens(raw);
@@ -1384,14 +1371,12 @@
       var fillersRemoved = all.length !== words.length;
       if (!words.length) { if (kind === "final") endPhrase(); return null; }
       var inZone = (state === "thinking" || state === "speaking") && micOpen();
-      var echoOn = config.echoGuard !== false;
       var refs = buildRefs();
       var done = function (v) { if (kind === "final") endPhrase(); return v; };
 
-      // A lone stop word is echo only if it is what the voice is saying right now.
+      // A lone stop word stops Claude.
       if (isStopWord(words)) {
         if (inZone) {
-          if (echoOn && nearSpeaking(words)) { ignoreOnce("echo"); return done(null); }
           return barge(words, kind, refs);
         }
         return fillersRemoved ? textOut(kind, words) : raw;
@@ -1401,8 +1386,8 @@
       if (ex.whole) { ignoreOnce("echo"); return done(null); }
       var real = words;
       if (ex.hasSpan) {
-        // The rest is probably misheard echo: it counts only as a long enough run, or one starting with a stop word.
-        var minRun = echoOn ? Math.max(1, Number(config.mixedMinWords) || 3) : Math.max(1, Number(config.bargeInMinWords) || 1);
+        // Words matching the phrase's committed text are skipped: the rest counts only as a long enough run, or one starting with a stop word.
+        var minRun = Math.max(1, Number(config.bargeInMinWords) || 1);
         real = [];
         var run = [];
         var flushRun = function () {
@@ -1433,7 +1418,7 @@
       // "" means the phrase settled; its final follows (or preceded). Keep the last guess until the
       // next final replaces it, so the settle itself is not a change.
       if (!t) {
-        if (config.duplex) endPhrase();
+        if (config.duplex) { endPhrase(); if (dropState) dropState.settled = true; }
         if (partial && !droppedGuess) {
           droppedGuess = true;
           checkedSinceDrop = false;
@@ -1595,6 +1580,7 @@
       abortSpeculative("floor taken");
       clearTimers();
       cutOffReply();
+      echoTail = null; // the user took the floor on purpose: their next words are heard
       // Must stay synchronous: the platform only allows the mic to start inside the gesture.
       if (!open || micStopping) startMic();
       setState("listening");
@@ -1675,6 +1661,8 @@
       clearNotes();
       pausePending = false;
       echoTail = null;
+      dropState = null;
+      speakersNoted = false;
       held = [];
       graceCarry = [];
       endPhrase();

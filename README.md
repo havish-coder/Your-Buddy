@@ -33,9 +33,10 @@ Three steps in all: change into the folder, start the server, open the address. 
 
 ## Use headphones
 
-Without headphones, your microphone also picks up Claude's voice coming out of your speakers, and Claude can end up answering itself or being cut off by its own words. The page has a filter that ignores words that match what Claude has just said, and it handles most of it, but it is a guess. It cannot tell your voice from Claude's if you repeat Claude's words, and a loud room or loud speakers will still cause trouble.
+On the first run the page asks whether you are using headphones. You can change the answer later with the **I'm using headphones** checkbox in the settings.
 
-With headphones there is no echo to filter. Tick **I'm using headphones** in the page's settings and the filter is switched off, which also lets you interrupt more reliably.
+- **Headphones:** the microphone stays open while Claude speaks, so you can interrupt just by talking.
+- **Speakers:** the microphone would hear Claude's own voice, so the page ignores all sound while Claude is thinking or speaking, and for a moment after it stops. Nothing said in that time is kept. To interrupt, press Space (or click or tap the floor button), then speak.
 
 ## Settings
 
@@ -63,7 +64,7 @@ The server refuses any request whose Host or Origin is not `localhost` or `127.0
 
 **Claude does not hear me, or the page says the microphone is blocked.** Check that Chrome has permission for the microphone (lock icon in the address bar) and that the right input device is selected in your system settings. Speech recognition needs an internet connection.
 
-**Claude answers itself, or cuts itself off.** That is echo from your speakers. Use headphones and tick the headphones option, or turn the volume down.
+**Claude answers itself, or cuts itself off.** The page thinks you are on headphones while you are using speakers. Untick **I'm using headphones** in the settings. On speakers, Claude ignores your voice while it speaks, so press Space to interrupt.
 
 **"Port 3000 is already in use."** Another program is using the port. Start on another one: `PORT=3001 node server.js`, then open `http://localhost:3001`.
 

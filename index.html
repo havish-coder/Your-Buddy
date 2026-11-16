@@ -306,6 +306,11 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
         <div id="notesHead"><span>Claude's notes</span><button id="notesToggle" type="button" aria-expanded="true">Hide</button></div>
         <div id="notesText" aria-live="off">Listening…</div>
       </div>
+      <div class="note" id="hpPrompt" role="group" aria-label="Headphones" hidden>
+        <span id="hpPromptText">Are you using headphones?</span>
+        <button id="hpYes" type="button">Yes, headphones</button>
+        <button id="hpNo" type="button">No, speakers</button>
+      </div>
       <div id="floorBar">
         <button id="floor" type="button" data-holder="open" data-mode="idle" disabled>
           <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
@@ -336,7 +341,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
       </label>
       <div class="field" id="fieldHeadphones" hidden>
         <label class="check" for="setHeadphones"><input type="checkbox" id="setHeadphones"> <span>I'm using headphones</span></label>
-        <div class="note">Without headphones Claude may hear its own voice. The echo filter handles most of it.</div>
+        <div class="note">With headphones you can interrupt Claude just by talking. On speakers the mic ignores sound while Claude is speaking, so press Space to interrupt.</div>
       </div>
       <label class="field" for="setVoice" id="fieldVoice" hidden>
         <span class="lab"><span>Voice</span></span>
@@ -404,7 +409,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
   var MAX_RATE = LOCAL && LOCAL.maxRate > 1.5 ? LOCAL.maxRate : 1.5;
 
   /* ---------- settings ---------- */
-  var settings = { rate: D.rate || 1.15, voiceName: D.voiceName || "buttery", assertiveness: D.assertiveness == null ? 2 : D.assertiveness, tier: "quick", topic: "", headphones: false, mode: "conversation", tone: "rough", listen: 8, strict: 20, sound: true, notesOn: true };
+  var settings = { rate: D.rate || 1.15, voiceName: D.voiceName || "buttery", assertiveness: D.assertiveness == null ? 2 : D.assertiveness, tier: "quick", topic: "", headphones: false, headphonesChosen: false, mode: "conversation", tone: "rough", listen: 8, strict: 20, sound: true, notesOn: true };
   try {
     var saved = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
     if (saved && typeof saved === "object") {
@@ -419,6 +424,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
       if (saved.sound === false) settings.sound = false;
       if (saved.notesOn === false) settings.notesOn = false;
       if (LOCAL && saved.headphones === true) settings.headphones = true;
+      if (LOCAL && (saved.headphonesChosen === true || saved.headphones === true)) settings.headphonesChosen = true;
       if (typeof saved.topic === "string") settings.topic = saved.topic.slice(0, 300);
     }
   } catch (e) {}
@@ -671,7 +677,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
     var how = coarse ? "Tap" : (inBox ? "Click here" : "Press Space or tap");
     if (state === "listening") { holder = "you"; mode = "listening"; who = "Floor: you"; label = "Listening"; }
     else if (state === "thinking") { holder = "claude"; mode = "thinking"; who = "Floor: Claude"; label = "Thinking"; }
-    else if (state === "speaking") { holder = "claude"; mode = "speaking"; who = "Floor: Claude"; label = LOCAL ? "Speaking. Talk to cut in" + (coarse ? "" : inBox ? ", or click here" : ", or press Space") : "Speaking. " + (coarse ? "Tap to cut in" : inBox ? "Click here to cut in" : "Press Space to cut in"); }
+    else if (state === "speaking") { holder = "claude"; mode = "speaking"; who = "Floor: Claude"; label = LOCAL && settings.headphones ? "Speaking. Talk to cut in" + (coarse ? "" : inBox ? ", or click here" : ", or press Space") : "Speaking. " + (coarse ? "Tap to cut in" : inBox ? "Click here to cut in" : "Press Space to cut in"); }
     else if (yourTurn) { holder = "yours"; who = "Floor: yours"; label = "Your turn. " + how + " to talk"; }
     else if (!touched) { label = how + " to start talking"; }
     else { label = how + " to talk"; }
@@ -1121,7 +1127,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
   function applySettingsToUI() {
     $("setSpeed").max = String(MAX_RATE);
     $("setSpeed").value = String(settings.rate);
-    if (LOCAL) { $("fieldHeadphones").hidden = false; $("setHeadphones").checked = settings.headphones; $("emptyThird").textContent = "Talk over Claude to take the floor back, or press Space."; }
+    if (LOCAL) { $("fieldHeadphones").hidden = false; $("setHeadphones").checked = settings.headphones; $("hpPrompt").hidden = settings.headphonesChosen; $("emptyThird").textContent = "Press Space to take the floor back."; }
     $("setSpeedVal").textContent = Number(settings.rate).toFixed(2);
     $("setAssert").value = String(settings.assertiveness);
     $("setAssertVal").textContent = ASSERT_LABELS[settings.assertiveness];
@@ -1159,8 +1165,15 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
   });
   $("setSound").addEventListener("change", function (e) { settings.sound = !!e.target.checked; saveSettings(); });
   $("setHeadphones").addEventListener("change", function (e) {
-    settings.headphones = !!e.target.checked; saveSettings(); pushConfig({ echoGuard: !settings.headphones });
+    setHeadphones(!!e.target.checked);
   });
+  function setHeadphones(on) {
+    settings.headphones = on; settings.headphonesChosen = true; saveSettings();
+    $("setHeadphones").checked = on; $("hpPrompt").hidden = true;
+    pushConfig({ echoGuard: !on }); renderFloor();
+  }
+  $("hpYes").addEventListener("click", function () { setHeadphones(true); });
+  $("hpNo").addEventListener("click", function () { setHeadphones(false); });
   $("setVoice").addEventListener("change", function (e) {
     settings.voiceName = e.target.value; saveSettings(); pushConfig({ voiceName: settings.voiceName });
   });

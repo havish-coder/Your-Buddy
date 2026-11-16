@@ -2293,7 +2293,7 @@ test("D1 duplex: the mic stays open through commit and speech; a finished reply 
 });
 
 test("D2 two real words while speaking cut Claude off; they (and the rest of the phrase) start the next utterance", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   await dupSpeaking(t);
   const id0 = t.voice.calls[0].lines[0].id;
   t.voice.position(0, 0, id0);
@@ -2316,7 +2316,7 @@ test("D2 two real words while speaking cut Claude off; they (and the rest of the
 });
 
 test("D3 a lone backchannel does not stop Claude; one decision per phrase", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   await dupSpeaking(t);
   t.mic.partial("yeah");
   t.mic.final("yeah");
@@ -2332,62 +2332,21 @@ test("D3 a lone backchannel does not stop Claude; one decision per phrase", asyn
 });
 
 test("D4 a lone stop word stops Claude", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   await dupSpeaking(t);
   t.mic.partial("stop");
   await flush();
   assert.strictEqual(t.eng.getState(), "listening");
   assert.strictEqual(t.voice.stopCalls, 1);
   assert.deepStrictEqual(bi(t), ["cut:stop"]);
-  const u = dup();
+  const u = dup({ echoGuard: false });
   await dupSpeaking(u);
   u.mic.final("hold on");
   assert.strictEqual(u.eng.getState(), "listening");
-  const w = dup();
+  const w = dup({ echoGuard: false });
   await dupSpeaking(w);
   w.mic.partial("cats");
   assert.strictEqual(w.eng.getState(), "speaking", "one ordinary word is under bargeInMinWords");
-});
-
-test("D5 pure echo of the reply is ignored during speech and for the tail after it", async () => {
-  const t = dup();
-  await dupSpeaking(t);
-  t.mic.partial("tides");
-  t.mic.partial("tides come from");
-  t.mic.partial("tides come from the moon");
-  t.mic.final("tides come from the moon");
-  await flush();
-  assert.strictEqual(t.eng.getState(), "speaking");
-  assert.strictEqual(t.voice.stopCalls, 0);
-  assert.deepStrictEqual(bi(t), ["ignored:echo"], "once per phrase");
-  t.voice.finishAll();
-  await flush();
-  assert.strictEqual(t.eng.getState(), "listening");
-  await t.clock.advance(500);
-  t.mic.partial("and the sun adds");
-  t.mic.final(" and the sun adds a bit");
-  await t.clock.advance(5000);
-  assert.strictEqual(t.eng.getInfo().utterance, "", "Claude's own voice is not an utterance");
-  assert.strictEqual(t.model.calls.length, 1, "Claude never answers its own voice");
-  // after the tail the same words are the user's
-  await t.clock.advance(1500);
-  t.mic.final(" and the sun adds a bit");
-  assert.strictEqual(t.eng.getInfo().utterance, "and the sun adds a bit");
-});
-
-test("D6 echo plus real words is a barge-in and only the real words are kept, through the rest of the phrase", async () => {
-  const t = dup();
-  await dupSpeaking(t);
-  t.mic.partial("tides come from the moon I really");
-  assert.strictEqual(t.eng.getState(), "speaking", "two leftover words next to an echo span are probably misheard");
-  t.mic.partial("tides come from the moon I really disagree with that");
-  assert.strictEqual(t.eng.getState(), "listening");
-  assert.strictEqual(t.eng.getInfo().utterance, "I really disagree with that");
-  t.mic.final("tides come from the moon I really disagree with that point");
-  assert.strictEqual(t.eng.getInfo().utterance, "I really disagree with that point");
-  assert.deepStrictEqual(bi(t), ["ignored:mishearing", "cut:I really disagree with that"]);
-  await t.clock.advance(600);
-  assert.doesNotMatch(t.model.last().last.split("\n\n").slice(-2, -1)[0], /tides/);
 });
 
 test("D7 with echoGuard off the same echo words cut in", async () => {
@@ -2400,7 +2359,7 @@ test("D7 with echoGuard off the same echo words cut in", async () => {
 });
 
 test("D8 a cut-in followed by the user continuing: the committed words are not repeated", async () => {
-  const u = dup();
+  const u = dup({ echoGuard: false });
   u.eng.takeFloor();
   u.mic.partial("tell me about tides");
   await u.clock.advance(600);
@@ -2415,7 +2374,7 @@ test("D8 a cut-in followed by the user continuing: the committed words are not r
 });
 
 test("D9 barge-in before any audio: the assistant turn is removed; during a typed ask the ask is aborted", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   t.eng.takeFloor();
   t.mic.final("tell me about tides");
   await t.clock.advance(600);
@@ -2428,7 +2387,7 @@ test("D9 barge-in before any audio: the assistant turn is removed; during a type
   assert.deepStrictEqual(t.eng.getHistory().map((x) => x.role), ["user"]);
   assert.strictEqual(t.eng.getState(), "listening");
 
-  const u = dup();
+  const u = dup({ echoGuard: false });
   u.eng.takeFloor();
   u.eng.submitText("explain tides");
   await flush();
@@ -2460,8 +2419,8 @@ test("D10 minRate / maxRate bound the speech rate", async () => {
   assert.strictEqual(DEFAULTS.echoTailMs, 1500);
 });
 
-test("D11 takeFloor() during duplex speech cuts off without restarting the mic", async () => {
-  const t = dup();
+test("D11 headphones: takeFloor() during duplex speech cuts off without restarting the mic", async () => {
+  const t = dup({ echoGuard: false });
   await dupSpeaking(t);
   t.voice.position(0, 0, t.voice.calls[0].lines[0].id);
   t.voice.position(1000, 0, t.voice.calls[0].lines[0].id);
@@ -2470,9 +2429,8 @@ test("D11 takeFloor() during duplex speech cuts off without restarting the mic",
   assert.strictEqual(t.voice.stopCalls, 1);
   assert.strictEqual(t.eng.getState(), "listening");
   assert.strictEqual(t.eng.getHistory()[1].cutOff, true);
-  // the echo of what was cut is still filtered
   t.mic.final(" and the sun adds");
-  assert.strictEqual(t.eng.getInfo().utterance, "");
+  assert.strictEqual(t.eng.getInfo().utterance, "and the sun adds");
 });
 
 test("D12 stop() and reset() in duplex close the mic, silence the voice and forget the echo tail", async () => {
@@ -2507,7 +2465,7 @@ test("D13 the mic ending on its own while Claude speaks in duplex: speech finish
 });
 
 test("D14 the user starting to speak as Claude finishes: no words are lost", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   await dupSpeaking(t);
   t.mic.partial("cats");
   assert.strictEqual(t.eng.getState(), "speaking");
@@ -2518,7 +2476,7 @@ test("D14 the user starting to speak as Claude finishes: no words are lost", asy
   await t.clock.advance(600);
   assert.match(t.model.last().last, /cats are great/);
   // a lone final word that arrives after the reply finished is a normal utterance
-  const u = dup();
+  const u = dup({ echoGuard: false });
   await dupSpeaking(u);
   u.mic.partial("cats");
   u.voice.finishAll();
@@ -2526,17 +2484,6 @@ test("D14 the user starting to speak as Claude finishes: no words are lost", asy
   await u.clock.advance(2000);
   u.mic.final("cats");
   assert.strictEqual(u.eng.getInfo().utterance, "cats");
-});
-
-test("D15 echo in the tail is dropped from partials too, so no reply ask is triggered", async () => {
-  const t = dup();
-  await dupSpeaking(t);
-  t.voice.finishAll();
-  await flush();
-  t.mic.partial("the moon");
-  await t.clock.advance(3000);
-  assert.strictEqual(t.model.calls.length, 1);
-  assert.strictEqual(t.eng.getInfo().utterance, "");
 });
 
 test("D16 duplex off: nothing is filtered and speech does not barge in", async () => {
@@ -2562,7 +2509,7 @@ async function dupSpeaking2(t) {
 }
 
 test("E1 the user's words that merely occur in the reply are kept: 'the sun is actually a star' is a barge-in with all words", async () => {
-  const t = dup();
+  const t = dup({ echoGuard: false });
   await dupSpeaking2(t);
   t.mic.partial("the sun is actually a star");
   assert.strictEqual(t.eng.getState(), "listening");
@@ -2570,32 +2517,8 @@ test("E1 the user's words that merely occur in the reply are kept: 'the sun is a
   assert.deepStrictEqual(bi(t), ["cut:the sun is actually a star"]);
 });
 
-test("E2 four consecutive words of the reply are pure echo and ignored, also a single or scattered spoken word", async () => {
-  const t = dup();
-  await dupSpeaking2(t);
-  t.mic.partial("moon pulls the oceans");
-  t.mic.final("moon pulls the oceans");
-  t.mic.final("oceans");
-  t.mic.final("the sun");
-  await flush();
-  assert.strictEqual(t.eng.getState(), "speaking");
-  assert.strictEqual(t.voice.stopCalls, 0);
-  assert.strictEqual(t.eng.getInfo().utterance, "");
-  assert.ok(bi(t).every((x) => x === "ignored:echo"), bi(t).join());
-});
-
-test("E3 an echo run followed by real words keeps only the real words", async () => {
-  const t = dup();
-  await dupSpeaking2(t);
-  t.mic.partial("pulls the oceans no that's wrong");
-  assert.strictEqual(t.eng.getState(), "listening");
-  assert.strictEqual(t.eng.getInfo().utterance, "no that's wrong");
-  t.mic.final("pulls the oceans no that's wrong at all");
-  assert.strictEqual(t.eng.getInfo().utterance, "no that's wrong at all");
-});
-
-test("E4 a lone ordinary-word final while Claude speaks is kept for the next utterance, not lost", async () => {
-  const t = dup();
+test("E4 a lone ordinary-word final while Claude speaks is kept for the next utterance, not lost (headphones)", async () => {
+  const t = dup({ echoGuard: false });
   await dupSpeaking2(t);
   t.mic.final("cats");
   assert.strictEqual(t.eng.getState(), "speaking");
@@ -2609,56 +2532,137 @@ test("E4 a lone ordinary-word final while Claude speaks is kept for the next utt
   assert.match(t.model.last().last, /cats/);
 
   // cut off by a tap: the word starts the new utterance
-  const u = dup();
+  const u = dup({ echoGuard: false });
   await dupSpeaking2(u);
   u.mic.final("cats");
   u.eng.takeFloor();
   assert.strictEqual(u.eng.getInfo().utterance, "cats");
 
   // followed by a barge-in: it is in front of the barge-in words
-  const v = dup();
+  const v = dup({ echoGuard: false });
   await dupSpeaking2(v);
   v.mic.final("cats");
   v.mic.partial("tell me more");
   assert.strictEqual(v.eng.getInfo().utterance, "cats tell me more");
 
   // a backchannel or an echo word is not kept
-  const w = dup();
+  const w = dup({ echoGuard: false });
   await dupSpeaking2(w);
   w.mic.final("yeah");
-  w.mic.final("moon");
   w.voice.finishAll();
   await flush();
   assert.strictEqual(w.eng.getInfo().utterance, "");
   // stop() forgets it
-  const x = dup();
+  const x = dup({ echoGuard: false });
   await dupSpeaking2(x);
   x.mic.final("cats");
   await x.eng.stop();
   assert.strictEqual(x.eng.getInfo().utterance, "");
 });
 
-test("E5 the same rules apply inside the tail after the voice stops", async () => {
-  const mk = async () => { const t = dup(); await dupSpeaking2(t); t.voice.finishAll(); await flush(); await t.clock.advance(300); return t; };
-  let t = await mk();
-  t.mic.final(" the sun is actually a star");
-  assert.strictEqual(t.eng.getInfo().utterance, "the sun is actually a star", "scattered reply words are the user's");
-  t = await mk();
-  t.mic.partial("moon pulls the oceans");
-  t.mic.final(" moon pulls the oceans");
-  t.mic.final(" oceans");
-  t.mic.final(" the sun");
-  assert.strictEqual(t.eng.getInfo().utterance, "", "pure echo dropped");
+// Speakers (echoGuard true): the mic is deaf while Claude thinks or speaks and for echoTailMs after.
+const hpDup = (cfg = {}) => dup(Object.assign({ echoGuard: false }, cfg));
+
+test("S1 speakers: words heard while Claude speaks are dropped and Claude keeps speaking", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.mic.partial("tides come from");
+  t.mic.final("tides come from the moon");
+  t.mic.partial("stop");
+  t.mic.final("no stop wait I disagree completely");
+  await flush();
+  assert.strictEqual(t.eng.getState(), "speaking");
+  assert.strictEqual(t.voice.stopCalls, 0);
+  assert.strictEqual(t.eng.getInfo().utterance, "");
+  assert.deepStrictEqual(bi(t), ["ignored:speakers"], "once per reply");
+  t.voice.finishAll();
+  await flush();
+  assert.strictEqual(t.eng.getState(), "listening");
+  assert.strictEqual(t.eng.getInfo().utterance, "", "nothing was held for later");
+});
+
+test("S2 speakers: the same words inside the tail after the voice stops are dropped; Claude does not answer them", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.voice.finishAll();
+  await flush();
+  await t.clock.advance(300);
+  t.mic.partial("and the sun");
+  t.mic.final(" and the sun adds a bit");
+  t.mic.final(" cats are great");
   await t.clock.advance(5000);
-  assert.strictEqual(t.model.calls.length, 1);
-  t = await mk();
-  t.mic.final(" pulls the oceans no that's wrong");
-  assert.strictEqual(t.eng.getInfo().utterance, "no that's wrong");
-  t = await mk();
-  t.mic.final(" cats");
-  assert.strictEqual(t.eng.getInfo().utterance, "cats");
+  assert.strictEqual(t.eng.getInfo().utterance, "");
+  assert.strictEqual(t.model.calls.length, 1, "Claude never answers what it heard in the window");
+  assert.deepStrictEqual(bi(t), ["ignored:speakers"]);
+});
+
+test("S3 speakers: words after the tail are heard normally and get a reply", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.voice.finishAll();
+  await flush();
+  await t.clock.advance(1600);
+  t.mic.partial("what about");
+  t.mic.final("what about the sun");
+  assert.strictEqual(t.eng.getInfo().utterance, "what about the sun");
   await t.clock.advance(600);
-  assert.match(t.model.last().last, /cats/);
+  assert.strictEqual(t.model.calls.length, 2);
+  assert.match(t.model.last().last, /what about the sun/);
+});
+
+test("S4 speakers: a phrase whose partials began during speech and whose final lands after the tail is dropped whole", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.mic.partial("tides come");
+  t.voice.finishAll();
+  await flush();
+  await t.clock.advance(1000);
+  t.mic.partial("tides come from the");
+  await t.clock.advance(1000); // now past the tail
+  t.mic.partial("tides come from the moon and the sun");
+  await t.clock.advance(500);
+  t.mic.final("tides come from the moon and the sun");
+  await t.clock.advance(5000);
+  assert.strictEqual(t.eng.getInfo().utterance, "", "Claude's words do not leak");
+  assert.strictEqual(t.model.calls.length, 1);
+  // the next phrase is heard
+  t.mic.partial("really");
+  t.mic.final("really interesting");
+  assert.strictEqual(t.eng.getInfo().utterance, "really interesting");
+});
+
+test("S5 speakers: takeFloor() during speech still cuts Claude off and the next words are heard", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.mic.final("ignored words while speaking");
+  t.voice.position(0, 0, t.voice.calls[0].lines[0].id);
+  t.voice.position(1000, 0, t.voice.calls[0].lines[0].id);
+  t.eng.takeFloor();
+  assert.strictEqual(t.eng.getState(), "listening");
+  assert.strictEqual(t.voice.stopCalls, 1);
+  assert.strictEqual(t.eng.getHistory()[1].cutOff, true);
+  t.mic.partial("actually");
+  t.mic.final("actually tell me about waves");
+  assert.strictEqual(t.eng.getInfo().utterance, "actually tell me about waves");
+  await t.clock.advance(600);
+  assert.strictEqual(t.model.calls.length, 2);
+});
+
+test("H1 headphones: two real words still cut Claude off", async () => {
+  const t = hpDup();
+  await dupSpeaking(t);
+  t.mic.partial("tell me");
+  assert.strictEqual(t.eng.getState(), "listening");
+  assert.strictEqual(t.voice.stopCalls, 1);
+  assert.strictEqual(t.eng.getInfo().utterance, "tell me");
+});
+
+test("H2 headphones: a lone yeah still does not cut Claude off", async () => {
+  const t = hpDup();
+  await dupSpeaking(t);
+  t.mic.final("yeah");
+  assert.strictEqual(t.eng.getState(), "speaking");
+  assert.strictEqual(t.voice.stopCalls, 0);
 });
 
 // =====================================================================

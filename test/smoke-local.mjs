@@ -88,11 +88,17 @@ async function newPage({ width = 1280, height = 800, scheme = "light", msPerChar
   page.on("console", (m) => { if (m.type() === "error") errors.push("console: " + m.text()); });
   await page.route(/fonts\.(googleapis|gstatic)\.com/, (r) => r.fulfill({ status: 200, contentType: "text/css", body: "" }));
   await page.addInitScript(installFakes, { msPerChar });
-  if (preset) await page.addInitScript(preset);
+  if (preset) await (Array.isArray(preset) ? page.addInitScript(preset[0], preset[1]) : page.addInitScript(preset));
   await page.goto(BASE);
   await page.waitForFunction(() => document.getElementById("noteConnecting").hidden === true, null, { timeout: 8000 });
   page.__errors = errors; page.__ctx = ctx;
   return page;
+}
+const choose = (headphones) => ({ h: headphones, key: "openfloor.settings.v2" });
+const presetHp = (o) => { localStorage.setItem(o.key, JSON.stringify({ headphones: o.h, headphonesChosen: true })); };
+async function newChosen(headphones, opts = {}) {
+  const ctx0 = choose(headphones);
+  return newPage({ ...opts, preset: [presetHp, ctx0] });
 }
 const fake = (page, fn, arg) => page.evaluate(fn, arg);
 const waitFor = (page, fn, arg, timeout = 8000) => page.waitForFunction(fn, arg, { timeout });
@@ -118,7 +124,7 @@ await check("1 local page loads with the shim and no console errors", async () =
   const page = await newPage();
   assert(await page.evaluate(() => !!(window.OPEN_FLOOR_LOCAL && window.OPEN_FLOOR_LOCAL.duplex)), "OPEN_FLOOR_LOCAL missing");
   assert(await page.locator("#empty").isVisible(), "empty state not shown");
-  assert(/talk over/i.test(await page.locator("#emptyThird").innerText()), "local empty-state wording missing");
+  assert(/press space/i.test(await page.locator("#emptyThird").innerText()), "local empty-state wording missing");
   assert(await page.locator("#fieldHeadphones").isVisible(), "headphones setting hidden in local mode");
   noErrors(page); await page.__ctx.close();
 });
@@ -140,8 +146,8 @@ await check("2 one click starts listening; a pause gives a spoken reply and list
   noErrors(page); await page.__ctx.close();
 });
 
-await check("3 real words spoken over the reply cut it off with no key press", async () => {
-  const page = await newPage({ msPerChar: 70 });
+await check("3 headphones: real words spoken over the reply cut it off with no key press", async () => {
+  const page = await newChosen(true, { msPerChar: 70 });
   await startAndAsk(page);
   await page.waitForTimeout(1300); // long enough that some words were heard, so the turn is kept and marked cut off
   await fake(page, () => window.__fake.say.final("purple elephants dance gracefully"));
@@ -151,22 +157,28 @@ await check("3 real words spoken over the reply cut it off with no key press", a
   noErrors(page); await page.__ctx.close();
 });
 
-await check("4 the reply's own words coming back through the mic do not cut it off", async () => {
-  const page = await newPage({ msPerChar: 90 });
+await check("4 speakers: the reply's own words and other words during speech do not cut it off; Space does", async () => {
+  const page = await newChosen(false, { msPerChar: 90 });
   await startAndAsk(page);
+  assert((await label(page)) === "Speaking. Press Space to cut in", "speakers label: " + await label(page));
   const reply = await page.locator(".turn.assistant .say").first().innerText();
   await page.waitForTimeout(200);
   await fake(page, (t) => window.__fake.say.final(t), reply);
+  await fake(page, () => window.__fake.say.final("purple elephants dance gracefully"));
   await page.waitForTimeout(700);
-  assert((await page.locator(".turn.assistant .tag.cut").count()) === 0, "echo cut the reply off");
-  assert(/^Speaking/.test(await label(page)), "no longer speaking after echo: " + await label(page));
+  assert((await page.locator(".turn.assistant .tag.cut").count()) === 0, "mic words cut the reply off");
+  assert(/^Speaking/.test(await label(page)), "no longer speaking: " + await label(page));
+  await page.keyboard.press("Space");
+  await cutTag(page);
+  await listening(page);
   noErrors(page); await page.__ctx.close();
 });
 
-await check("5 the headphones toggle reaches the engine (echo words then cut in)", async () => {
-  const page = await newPage({ msPerChar: 120 });
+await check("5 the headphones toggle reaches the engine and the label (echo words then cut in)", async () => {
+  const page = await newChosen(false, { msPerChar: 120 });
   await page.check("#setHeadphones");
   await startAndAsk(page);
+  assert((await label(page)) === "Speaking. Talk to cut in, or press Space", "headphones label: " + await label(page));
   const reply = await page.locator(".turn.assistant .say").first().innerText();
   await page.waitForTimeout(1300);
   await fake(page, (t) => window.__fake.say.final(t), reply);
@@ -225,6 +237,31 @@ await check("9 taking the floor while Claude is still thinking aborts the ask pr
   assert((await page.locator(".turn.assistant").count()) === 0, "a half answer was left on screen");
   assert((await fake(page, () => window.__fake.spoken.length)) === 0, "something was spoken after the abort");
   noErrors(page); await page.__ctx.close();
+});
+
+await check("11 first run: the headphones prompt appears once and each button works", async () => {
+  const page = await newPage();
+  assert(await page.locator("#hpPrompt").isVisible(), "prompt not shown on first run");
+  assert(/Are you using headphones\?/.test(await page.locator("#hpPrompt").innerText()), "prompt text");
+  assert((await page.locator("#hpYes").innerText()) === "Yes, headphones" && (await page.locator("#hpNo").innerText()) === "No, speakers", "button text");
+  await page.click("#hpYes");
+  assert(!(await page.locator("#hpPrompt").isVisible()), "prompt still shown");
+  assert(await page.locator("#setHeadphones").isChecked(), "checkbox not set by Yes");
+  await page.reload();
+  await page.waitForFunction(() => document.getElementById("noteConnecting").hidden === true, null, { timeout: 8000 });
+  assert(!(await page.locator("#hpPrompt").isVisible()), "prompt shown again after the choice");
+  assert(await page.locator("#setHeadphones").isChecked(), "choice not remembered");
+  await page.__ctx.close();
+  const p2 = await newPage();
+  await p2.check("#setHeadphones"); // using the checkbox also counts as a choice
+  assert(!(await p2.locator("#hpPrompt").isVisible()), "prompt still shown after the checkbox");
+  await p2.__ctx.close();
+  const p3 = await newPage();
+  await p3.click("#hpNo");
+  assert(!(await p3.locator("#hpPrompt").isVisible()) && !(await p3.locator("#setHeadphones").isChecked()), "No did not set speakers");
+  await startAndAsk(p3);
+  assert((await label(p3)) === "Speaking. Press Space to cut in", "speakers label after No: " + await label(p3));
+  noErrors(p3); await p3.__ctx.close();
 });
 
 await check("10 screenshots of the local page in light and dark", async () => {
