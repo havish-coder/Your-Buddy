@@ -366,7 +366,7 @@ test("a body over 12 MB is refused, one a little under is accepted", async () =>
     assert.ok(ok.lines.at(-1).done);
     // same limit when the length is not declared up front
     const chunked = await new Promise((resolve) => {
-      const req = http.request({ host: "127.0.0.1", port: s.port, method: "POST", path: "/api/ask", headers: { host: `localhost:${s.port}`, "transfer-encoding": "chunked" } }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+      const req = http.request({ host: "127.0.0.1", port: s.port, method: "POST", path: "/api/ask", headers: { host: `localhost:${s.port}`, "content-type": "application/json", "transfer-encoding": "chunked" } }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
       req.on("error", () => resolve("reset"));
       const chunk = Buffer.alloc(1024 * 1024, 97);
       let i = 0;
@@ -522,4 +522,161 @@ test.after(() => {
   const ps = execFileSync("ps", ["-eo", "pid,args"], { encoding: "utf8" }).split("\n").filter((l) => l.includes("fake-claude.mjs") && !l.includes(" ps "));
   fs.rmSync(TMP, { recursive: true, force: true });
   assert.deepEqual(ps, [], "no fake-claude process may be left behind:\n" + ps.join("\n"));
+});
+
+
+// ------------------------------------------------------------------ hardening
+
+function rawAsk(port, payload) {
+  const req = http.request({ host: "127.0.0.1", port, method: "POST", path: "/api/ask", headers: { host: "localhost:" + port, "content-type": "application/json" } });
+  const p = new Promise((resolve) => { req.on("response", (res) => { res.resume(); res.on("error", () => {}); resolve(res.statusCode); }); req.on("error", () => {}); });
+  req.end(JSON.stringify(payload));
+  return { req, p };
+}
+const lastLine = (r) => r.lines[r.lines.length - 1];
+
+test("children run in a private open-floor-* folder with mode 0700, removed on exit", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  let cwd;
+  try {
+    const r = await ask(srv.port, { messages: [U("hello")] });
+    assert.strictEqual(lastLine(r).done, true);
+    cwd = srv.starts()[0].cwd;
+    assert.ok(path.basename(cwd).startsWith("open-floor-"), cwd);
+    assert.notStrictEqual(fs.realpathSync(cwd), fs.realpathSync(os.tmpdir()));
+    if (process.platform !== "win32") assert.strictEqual(fs.statSync(cwd).mode & 0o777, 0o700);
+  } finally { await srv.stop(); }
+  assert.strictEqual(fs.existsSync(cwd), false);
+});
+
+test("only --permission-prompts is dropped, and only as the quoted subject of the phrase", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0", OPEN_FLOOR_FAKE_UNKNOWN_FLAG: "--permission-prompts", OPEN_FLOOR_FAKE_UNKNOWN: "error: unknown option '--permission-prompts' (see --strict-mcp-config)" });
+  try {
+    const r = await ask(srv.port, { messages: [U("hello")] });
+    assert.strictEqual(lastLine(r).done, true);
+    const s = srv.starts();
+    assert.ok(s[0].args.includes("--permission-prompts"));
+    const last = s[s.length - 1].args;
+    assert.ok(!last.includes("--permission-prompts"));
+    for (const f of ["--strict-mcp-config", "--disable-slash-commands", "--tools", "--no-session-persistence"]) assert.ok(last.includes(f), f);
+  } finally { await srv.stop(); }
+});
+
+test("a rejected security flag fails the ask and is never dropped", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0", OPEN_FLOOR_FAKE_UNKNOWN_FLAG: "--strict-mcp-config", OPEN_FLOOR_FAKE_UNKNOWN: "error: unknown option '--strict-mcp-config'" });
+  try {
+    const r = await ask(srv.port, { messages: [U("hello")] });
+    assert.strictEqual(lastLine(r).error.code, "upstream_error");
+    await sleep(200);
+    const s = srv.starts();
+    assert.strictEqual(s.length, 1);
+    assert.ok(s.every((x) => x.args.includes("--strict-mcp-config")));
+    assert.ok(srv.serverLog().includes("--strict-mcp-config"));
+  } finally { await srv.stop(); }
+});
+
+test("asks in flight are capped; the extra one gets 429 and starts no child", async () => {
+  const srv = await startServer({ OPEN_FLOOR_MAX_ASKS: "2", OPEN_FLOOR_PRESTART: "0" });
+  const a = rawAsk(srv.port, { messages: [U("[[hang]] one")] });
+  const b = rawAsk(srv.port, { messages: [U("[[hang]] two")] });
+  try {
+    assert.deepStrictEqual([await a.p, await b.p], [200, 200]);
+    await waitFor(() => srv.starts().length === 2, 5000, "two children");
+    const c = await ask(srv.port, { messages: [U("third")] });
+    assert.strictEqual(c.status, 429);
+    assert.deepStrictEqual(c.lines, [{ error: { code: "rate_limited", message: "Too many requests at once." } }]);
+    await sleep(300);
+    assert.strictEqual(srv.starts().length, 2);
+    a.req.destroy();
+    const d = await waitFor(async () => { const r = await ask(srv.port, { messages: [U("again")] }); return r.status === 200 ? r : null; }, 5000, "a free slot");
+    assert.strictEqual(lastLine(d).done, true);
+  } finally { b.req.destroy(); await srv.stop(); }
+});
+
+test("end_turn finishes without waiting for a late result line", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0", OPEN_FLOOR_FAKE_RESULT_LAG_MS: "4000" });
+  try {
+    const t0 = Date.now();
+    const r = await ask(srv.port, { messages: [U("hello")] });
+    assert.strictEqual(lastLine(r).done, true);
+    assert.strictEqual(lastLine(r).truncated, undefined);
+    assert.ok(Date.now() - t0 < 3000, "waited for the result line");
+  } finally { await srv.stop(); }
+});
+
+test("max_tokens gives truncated: true; a refusal with no text gives refused", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  try {
+    const r = await ask(srv.port, { messages: [U("[[maxtokens]] hello")] });
+    assert.strictEqual(lastLine(r).done, true);
+    assert.strictEqual(lastLine(r).truncated, true);
+    assert.ok(lastLine(r).text.length > 0);
+    const f = await ask(srv.port, { messages: [U("[[refusal]] hello")] });
+    assert.strictEqual(lastLine(f).error.code, "refused");
+  } finally { await srv.stop(); }
+});
+
+test("SIGTERM during a slow ask ends the stream with an error line", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  const p = ask(srv.port, { messages: [U("[[slow]] hello")] });
+  await waitFor(() => srv.prompts().length > 0, 5000, "the ask to start");
+  srv.child.kill("SIGTERM");
+  const r = await p;
+  assert.deepStrictEqual(lastLine(r), { error: { code: "upstream_error", message: "The server is shutting down." } });
+  await srv.stop();
+});
+
+test("SIGHUP shuts the server down like SIGTERM", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  const r = await srv.stop("SIGHUP");
+  assert.strictEqual(r.c, 0);
+});
+
+test("framing headers are on every response", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  try {
+    for (const p of ["/", "/api/health"]) {
+      const r = await request(srv.port, { path: p });
+      assert.strictEqual(r.headers["x-frame-options"], "DENY", p);
+      assert.strictEqual(r.headers["content-security-policy"], "frame-ancestors 'none'", p);
+    }
+  } finally { await srv.stop(); }
+});
+
+test("POST /api/ask needs a JSON content type and a same-origin Sec-Fetch-Site", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  const body = JSON.stringify({ messages: [U("hello")] });
+  try {
+    for (const ct of ["text/plain", undefined]) {
+      const r = await request(srv.port, { method: "POST", path: "/api/ask", headers: ct ? { "content-type": ct } : {}, body });
+      assert.strictEqual(r.status, 415);
+      assert.ok(r.lines[0].error);
+    }
+    const ok = await request(srv.port, { method: "POST", path: "/api/ask", headers: { "content-type": "application/json; charset=utf-8" }, body });
+    assert.strictEqual(ok.status, 200);
+    for (const site of ["cross-site", "same-site"]) {
+      const r = await ask(srv.port, { messages: [U("hello")] }, { headers: { "content-type": "application/json", "sec-fetch-site": site } });
+      assert.strictEqual(r.status, 403, site);
+      assert.ok(r.lines[0].error);
+    }
+    for (const site of ["same-origin", "none"]) {
+      const r = await ask(srv.port, { messages: [U("hello")] }, { headers: { "content-type": "application/json", "sec-fetch-site": site } });
+      assert.strictEqual(r.status, 200, site);
+    }
+  } finally { await srv.stop(); }
+});
+
+test("Host and Origin checks treat a missing port as 80", () => {
+  const { hostOk, originOk } = require("../server.js");
+  assert.ok(hostOk("localhost", 80));
+  assert.ok(hostOk("localhost:80", 80));
+  assert.ok(hostOk("127.0.0.1:3000", 3000));
+  assert.ok(!hostOk("localhost", 3000));
+  assert.ok(!hostOk("localhost:81", 80));
+  assert.ok(!hostOk("evil.example", 80));
+  assert.ok(originOk("http://localhost", 80));
+  assert.ok(originOk("http://localhost:3000", 3000));
+  assert.ok(!originOk("http://localhost", 3000));
+  assert.ok(!originOk("http://localhost:81", 80));
+  assert.ok(originOk(undefined, 80));
 });

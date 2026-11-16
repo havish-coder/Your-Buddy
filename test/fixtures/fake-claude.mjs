@@ -35,7 +35,9 @@ if (!has("-p") && !has("--print")) { console.error("fake-claude: only print mode
 const streamIn = val("--input-format") === "stream-json";
 process.on("SIGTERM", () => process.exit(143));
 process.on("SIGINT", () => process.exit(130));
-log({ event: "start", args, streamIn });
+log({ event: "start", args, streamIn, cwd: process.cwd() });
+// OPEN_FLOOR_FAKE_UNKNOWN_FLAG=<flag> with OPEN_FLOOR_FAKE_UNKNOWN=<stderr text>: reject that flag like an old build would.
+if (process.env.OPEN_FLOOR_FAKE_UNKNOWN_FLAG && args.includes(process.env.OPEN_FLOOR_FAKE_UNKNOWN_FLAG)) { process.stderr.write((process.env.OPEN_FLOOR_FAKE_UNKNOWN || "error: unknown option") + "\n"); process.exit(2); }
 if (envMode === "dieidle" && streamIn) process.exit(1);
 
 // ---- read the prompt ----
@@ -66,7 +68,7 @@ if (streamIn) {
 }
 log({ event: "prompt", prompt, images });
 
-const magic = /\[\[(slow|notloggedin|ratelimit|crash|garbage|stderrauth|hang)\]\]/.exec(prompt);
+const magic = /\[\[(slow|notloggedin|ratelimit|crash|garbage|stderrauth|hang|maxtokens|refusal)\]\]/.exec(prompt);
 const mode = magic ? magic[1] : envMode;
 
 const model = val("--model") || "default";
@@ -107,8 +109,10 @@ if (mode === "crash") {
   process.exit(3);
 }
 
+const stopReason = mode === "maxtokens" ? "max_tokens" : mode === "refusal" ? "refusal" : "end_turn"; // [[maxtokens]] [[refusal]]
 let parts;
-if (mode === "slow") parts = Array.from({ length: 60 }, (_, i) => `word${i} `);
+if (mode === "refusal") parts = [];
+else if (mode === "slow") parts = Array.from({ length: 60 }, (_, i) => `word${i} `);
 else {
   const tail = prompt.trim().split(/\s+/).slice(-4).join(" ");
   const imgNote = images.length ? ` [${images.length} image${images.length > 1 ? "s" : ""}]` : "";
@@ -121,14 +125,14 @@ for (const p of parts) {
 }
 out({ type: "assistant", message: { model, id: msgId, type: "message", role: "assistant", content: [{ type: "text", text: full }], stop_reason: null, usage }, session_id: sid });
 out({ type: "stream_event", event: { type: "content_block_stop", index: 0 }, session_id: sid, parent_tool_use_id: null });
-out({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage }, session_id: sid, parent_tool_use_id: null });
+out({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage }, session_id: sid, parent_tool_use_id: null });
 out({ type: "stream_event", event: { type: "message_stop" }, session_id: sid, parent_tool_use_id: null });
 out({ type: "rate_limit_event", rate_limit_info: { status: "allowed" }, session_id: sid });
 // The real program spends a couple of seconds on a post-turn summary before the result line.
 const lag = Number(process.env.OPEN_FLOOR_FAKE_RESULT_LAG_MS ?? 150);
 await sleep(lag);
 out({ type: "system", subtype: "post_turn_summary", status_category: "completed", session_id: sid });
-result({ result: full });
+result({ result: full, stop_reason: stopReason });
 if (!streamIn) process.exit(0);
 // stream-json input: wait for stdin to close, then exit
 process.stdin.on("end", () => process.exit(0));

@@ -4,6 +4,8 @@ Open Floor is a page for talking with Claude out loud. You speak, Claude answers
 
 This folder is the version that runs on your own computer. A small server (`server.js`) shows the page in your browser and passes your conversation to the Claude Code program (`claude`) that is already installed and signed in on your machine. No API key is involved, and nothing is stored on disk.
 
+The server answers at most 3 asks at a time (set `OPEN_FLOOR_MAX_ASKS` to change that); more get a "too many requests" reply. It runs Claude Code in its own private temporary folder with tools switched off, and deletes that folder when it stops.
+
 ## What you need
 
 - **Node 22 or newer.** Check with `node --version`.

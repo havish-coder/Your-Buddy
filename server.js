@@ -12,6 +12,7 @@
 //   OPEN_FLOOR_PRESTART_MODELS models warmed at boot (default "haiku,sonnet"); any model used is re-warmed
 //   OPEN_FLOOR_IDLE_MS         replace an unused pre-started process after this long (default 600000)
 //   OPEN_FLOOR_ASK_TIMEOUT_MS  give up on an ask after this long without any output (default 120000)
+//   OPEN_FLOOR_MAX_ASKS        most asks answered at once; more get 429 (default 3)
 
 const http = require("node:http");
 const fs = require("node:fs");
@@ -27,20 +28,25 @@ const IDLE_MS = Number(process.env.OPEN_FLOOR_IDLE_MS) || 10 * 60 * 1000;
 const ASK_TIMEOUT_MS = Number(process.env.OPEN_FLOOR_ASK_TIMEOUT_MS) || 120 * 1000;
 const BOOT_MODELS = (process.env.OPEN_FLOOR_PRESTART_MODELS ?? "haiku,sonnet").split(",").map((s) => s.trim()).filter(Boolean);
 const MAX_BODY = 12 * 1024 * 1024;
+const MAX_ASKS = Math.max(1, Math.floor(Number(process.env.OPEN_FLOOR_MAX_ASKS)) || 3);
+// One private (mode 0700) working folder for every child, so no other local user can plant
+// .claude/settings.json or CLAUDE.md where Claude Code reads them. Removed on exit.
+const WORKDIR = fs.mkdtempSync(path.join(os.tmpdir(), "open-floor-"));
 const TIERS = { quick: "haiku", default: "sonnet", complex: "opus" };
 const SYSTEM_PROMPT = "You are Claude. Follow the instructions in the user's message exactly.";
 
-// Flags that older or newer builds might not know. If the program says one is unknown we drop it and retry.
+// Only this flag may be dropped (and the ask retried) when the program says it is unknown.
 const OPTIONAL_FLAGS = new Map([
   ["--permission-prompts", ["--permission-prompts", "none"]],
-  ["--strict-mcp-config", ["--strict-mcp-config"]],
-  ["--disable-slash-commands", ["--disable-slash-commands"]],
 ]);
+// Security flags: if the program rejects one of these the ask fails; we never run without them.
+const REQUIRED_FLAGS = ["--strict-mcp-config", "--disable-slash-commands", "--tools", "--no-session-persistence"];
 
 const MESSAGES = {
   not_granted: "Claude Code is not signed in on this computer. Run `claude`, type /login, then try again.",
   rate_limited: "Claude Code reports a usage or rate limit. Wait a while, then try again.",
   sampling_disabled: "The `claude` program was not found. Install Claude Code (or set OPEN_FLOOR_CLAUDE_BIN), then restart this server.",
+  refused: "Claude declined to answer that.",
   upstream_error: "Claude Code could not answer. The server's terminal window has the details.",
 };
 
@@ -53,7 +59,7 @@ function winQuote(a) { return a === "" || /[\s&|<>^()"]/.test(a) ? '"' + a + '"'
 
 // Every argument comes from constants in this file, never from a request. The prompt goes through stdin.
 function spawnClaude(args) {
-  const opts = { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"], windowsHide: true };
+  const opts = { cwd: WORKDIR, stdio: ["pipe", "pipe", "pipe"], windowsHide: true };
   if (/\.(mjs|cjs|js)$/i.test(BIN)) return spawn(process.execPath, [BIN, ...args], opts);
   if (IS_WIN && !/\.exe$/i.test(BIN)) {
     // `claude` may be claude.cmd, which Node will not spawn directly. All parts are fixed constants.
@@ -77,18 +83,21 @@ function buildArgs(alias, streamIn) {
   if (streamIn) a.push("--input-format", "stream-json");
   a.push("--output-format", "stream-json", "--verbose", "--include-partial-messages", "--model", alias, "--no-session-persistence", "--tools", "");
   for (const v of OPTIONAL_FLAGS.values()) a.push(...v);
+  a.push("--strict-mcp-config", "--disable-slash-commands");
   a.push("--system-prompt", SYSTEM_PROMPT);
   return a;
 }
 
+// The flag counts as unknown only when it is the quoted subject of the phrase, e.g. unknown option '--x'.
+const RE_UNKNOWN_FLAG = /(?:unknown|unrecognized|invalid)\s+(?:option|argument|flag)s?\s*:?\s*['"\x60‘“](--[A-Za-z0-9-]+)['"\x60’”]/gi;
+const unknownFlags = (text) => [...String(text).matchAll(RE_UNKNOWN_FLAG)].map((m) => m[1].toLowerCase());
+const rejectedRequiredFlag = (text) => unknownFlags(text).find((f) => REQUIRED_FLAGS.includes(f)) || null;
+
 // If stderr says an optional flag is unknown, forget the flag. Returns true when something changed.
 function dropUnknownFlag(text) {
   let changed = false;
-  for (const name of [...OPTIONAL_FLAGS.keys()]) {
-    if (text.includes(name) && /unknown (option|argument)|unrecognized|invalid option/i.test(text)) {
-      OPTIONAL_FLAGS.delete(name); changed = true;
-      log(`this claude does not know ${name}; running without it`);
-    }
+  for (const name of unknownFlags(text)) {
+    if (OPTIONAL_FLAGS.delete(name)) { changed = true; log("this claude does not know " + name + "; running without it"); }
   }
   return changed;
 }
@@ -202,6 +211,8 @@ function fill(alias) {
     const err = run.stderr.trim();
     if (err) log(`idle ${alias} process exited (${run.exit.code}): ${clip(err)}`);
     if (shuttingDown) return;
+    const rej = rejectedRequiredFlag(run.stderr);
+    if (rej) log("this claude rejected required flag " + rej + "; asks will fail until that is fixed");
     if (dropUnknownFlag(run.stderr)) { for (const r of [...pool.values()]) { pool.delete(r.alias); r.kill(); } fill(alias); return; }
     if (Date.now() - run.startedAt < 5000) state.failStreak++; // dying right away: back off
     const delay = state.failStreak ? Math.min(30000, 500 * 2 ** Math.min(state.failStreak, 6)) : 0;
@@ -241,7 +252,7 @@ function runAsk({ alias, prompt, images }, cb) {
   let cancelled = false, finished = false, current = null, retried = false, inactivity = null;
 
   function end() { clearTimeout(inactivity); finished = true; if (current) { current.kill(); } }
-  function succeed(text) { if (finished) return; end(); state.failStreak = 0; cb.done(text); }
+  function succeed(text, extra) { if (finished) return; end(); state.failStreak = 0; cb.done(text, extra); }
   function fail(code, why) {
     if (finished) return; end();
     if (why) log(`ask failed (${code}): ${clip(why)}`);
@@ -251,7 +262,7 @@ function runAsk({ alias, prompt, images }, cb) {
   function start() {
     const run = takeRun(alias);
     current = run;
-    let text = "", stopSeen = false, hint = "", resultSeen = false;
+    let text = "", stopReason = null, hint = "", resultSeen = false;
     const bump = () => { clearTimeout(inactivity); inactivity = setTimeout(() => { run.kill(); fail("upstream_error", "no output for " + ASK_TIMEOUT_MS + " ms"); }, ASK_TIMEOUT_MS); };
     bump();
     const sink = {
@@ -266,9 +277,9 @@ function runAsk({ alias, prompt, images }, cb) {
           if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta" && typeof ev.delta.text === "string") {
             text += ev.delta.text; cb.delta(ev.delta.text);
           } else if (ev.type === "message_delta" && ev.delta && ev.delta.stop_reason) {
-            stopSeen = true;
-          } else if (ev.type === "message_stop" && stopSeen && text) {
-            // The text is complete. The real program spends a few more seconds on a summary before its
+            stopReason = ev.delta.stop_reason;
+          } else if (ev.type === "message_stop" && stopReason === "end_turn" && text) {
+            // The text is complete (only for end_turn; other stop reasons wait for the result line). The real program spends a few more seconds on a summary before its
             // result line; nobody needs to wait for it.
             succeed(text);
           }
@@ -281,13 +292,21 @@ function runAsk({ alias, prompt, images }, cb) {
         } else if (j.type === "result") {
           resultSeen = true;
           if (j.is_error) fail(classify(String(j.result || "") + " " + (j.api_error_status || "") + hint + " " + run.stderr), "result error: " + String(j.result || "") + " status " + j.api_error_status);
-          else succeed(text || (typeof j.result === "string" ? j.result : ""));
+          else {
+            const reason = stopReason || j.stop_reason;
+            const final = text || (typeof j.result === "string" ? j.result : "");
+            if (reason === "refusal" && !final.trim()) fail("refused", "the model refused");
+            else if (reason === "max_tokens") succeed(final, { truncated: true });
+            else succeed(final);
+          }
         }
       },
       exit(info) {
         if (finished || cancelled) return;
         const err = (run.stderr + "\n" + run.junk).trim();
         if (run.spawnError && run.spawnError.code === "ENOENT") { state.found = false; return fail("sampling_disabled", String(run.spawnError)); }
+        const rej = rejectedRequiredFlag(run.stderr);
+        if (rej) return fail("upstream_error", "this claude rejected required flag " + rej + "; refusing to run without it. " + err);
         if (dropUnknownFlag(run.stderr) && !retried) { retried = true; return start(); }
         // A pre-started process that was already dead or died without saying anything: try once with a fresh one.
         if (!retried && run.used && !run.sawLine && !err) { retried = true; log("pre-started process was not usable; retrying with a fresh one"); return start(); }
@@ -345,7 +364,7 @@ const STATIC = {
   "/floor.js": { file: "floor.js", type: "text/javascript; charset=utf-8" },
   "/local/shim.js": { file: path.join("local", "shim.js"), type: "text/javascript; charset=utf-8" },
 };
-const BASE_HEADERS = { "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" };
+const BASE_HEADERS = { "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY", "content-security-policy": "frame-ancestors 'none'" };
 
 function send(res, status, type, body, extra) {
   res.writeHead(status, { ...BASE_HEADERS, "content-type": type, ...(extra || {}) });
@@ -356,15 +375,15 @@ const sendErrorLine = (res, status, code, message) => send(res, status, "applica
 
 function hostOk(value, port) {
   if (typeof value !== "string") return false;
-  const m = /^(localhost|127\.0\.0\.1|\[::1\]):(\d+)$/i.exec(value.trim());
-  return !!m && Number(m[2]) === port;
+  const m = /^(localhost|127\.0\.0\.1|\[::1\])(?::(\d+))?$/i.exec(value.trim());
+  return !!m && (m[2] === undefined ? 80 : Number(m[2])) === port; // no port means 80
 }
 function originOk(value, port) {
   if (value === undefined) return true; // same-origin GETs and non-browser clients send none
   let u;
   try { u = new URL(value); } catch { return false; }
   if (u.protocol !== "http:") return false;
-  return ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) && Number(u.port) === port;
+  return ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) && (u.port === "" ? 80 : Number(u.port)) === port;
 }
 
 function readBody(req, limit) {
@@ -378,6 +397,9 @@ function readBody(req, limit) {
   });
 }
 
+let activeAsks = 0;
+const openAsks = new Set(); // responses of asks that are streaming now
+
 async function handleAsk(req, res) {
   let raw;
   try { raw = await readBody(req, MAX_BODY); } catch (e) {
@@ -390,18 +412,25 @@ async function handleAsk(req, res) {
   if (bad) return sendErrorLine(res, 400, "upstream_error", "Bad request: " + bad + ".");
   const images = body.images && body.images.length ? body.images : [];
   if (images.length && !PRESTART) return sendErrorLine(res, 400, "upstream_error", "Images are not supported in this server mode.");
+  if (activeAsks >= MAX_ASKS) return sendErrorLine(res, 429, "rate_limited", "Too many requests at once.");
+  activeAsks++;
+  let released = false;
+  const release = () => { if (!released) { released = true; activeAsks--; } };
+  res.on("close", release);
   const alias = TIERS[body.tier || "default"];
   if (state.found === false && Date.now() - state.checkedAt > 5000) await probeVersion();
   if (state.found === false) return sendErrorLine(res, 200, "sampling_disabled", MESSAGES.sampling_disabled);
 
   res.writeHead(200, { ...BASE_HEADERS, "content-type": "application/x-ndjson; charset=utf-8" });
   res.flushHeaders();
+  openAsks.add(res);
+  res.on("close", () => openAsks.delete(res));
   let over = false;
   const line = (o) => { if (!over && !res.writableEnded && !res.destroyed) res.write(JSON.stringify(o) + "\n"); };
   const cancel = runAsk({ alias, prompt: flatten(body.messages), images }, {
     delta: (t) => line({ delta: t }),
-    done: (t) => { line({ done: true, text: t }); over = true; res.end(); },
-    error: (code) => { line({ error: { code, message: MESSAGES[code] || MESSAGES.upstream_error } }); over = true; res.end(); },
+    done: (t, extra) => { line({ done: true, text: t, ...(extra || {}) }); over = true; release(); res.end(); },
+    error: (code) => { line({ error: { code, message: MESSAGES[code] || MESSAGES.upstream_error } }); over = true; release(); res.end(); },
   });
   // The page aborted the fetch (or went away): stop the child at once.
   res.on("close", () => { if (!res.writableFinished) { over = true; cancel(); } });
@@ -414,6 +443,9 @@ function handle(req, res, port) {
 
   if (pathname === "/api/ask") {
     if (method !== "POST") return send(res, 405, "text/plain; charset=utf-8", "Method not allowed\n", { allow: "POST" });
+    const site = req.headers["sec-fetch-site"];
+    if (site !== undefined && site !== "same-origin" && site !== "none") return sendErrorLine(res, 403, "upstream_error", "Forbidden.");
+    if (!/^application\/json\s*(;|$)/i.test(String(req.headers["content-type"] || ""))) return sendErrorLine(res, 415, "upstream_error", "Content-Type must be application/json.");
     return handleAsk(req, res).catch((e) => { log("ask handler error", e); if (!res.headersSent) sendErrorLine(res, 500, "upstream_error", MESSAGES.upstream_error); else res.end(); });
   }
   if (pathname === "/api/health") {
@@ -442,14 +474,26 @@ function handle(req, res, port) {
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  setTimeout(() => process.exit(0), 2500).unref();
   for (const t of refillTimers) clearTimeout(t);
+  server.close();
+  // Tell every open ask why it ends, then give the lines a moment to leave before closing sockets.
+  const msg = JSON.stringify({ error: { code: "upstream_error", message: "The server is shutting down." } }) + "\n";
+  const flushed = [...openAsks].map((res) => new Promise((resolve) => {
+    if (res.destroyed || res.writableEnded) return resolve();
+    res.once("finish", resolve); res.once("close", resolve);
+    try { res.end(msg); } catch { resolve(); }
+  }));
+  openAsks.clear();
+  Promise.race([Promise.all(flushed), new Promise((r) => setTimeout(r, 500))]).then(finishShutdown);
+}
+
+function finishShutdown() {
   for (const r of pool.values()) r.kill();
   pool.clear();
   for (const c of children) killTree(c);
-  server.close();
   server.closeAllConnections();
   const wait = setInterval(() => { if (!children.size) { clearInterval(wait); process.exit(0); } }, 50);
-  setTimeout(() => process.exit(0), 2500).unref();
 }
 
 const server = http.createServer((req, res) => {
@@ -457,9 +501,11 @@ const server = http.createServer((req, res) => {
 });
 server.headersTimeout = 30000;
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-process.on("exit", () => { for (const c of children) { try { c.kill("SIGKILL"); } catch {} } });
+if (require.main === module) for (const s of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(s, shutdown);
+process.on("exit", () => {
+  for (const c of children) { try { c.kill("SIGKILL"); } catch {} }
+  try { fs.rmSync(WORKDIR, { recursive: true, force: true }); } catch {}
+});
 
 server.on("error", (e) => {
   if (e.code === "EADDRINUSE") console.error(`Port ${process.env.PORT || 3000} is already in use. Start with another one, for example: PORT=3001 node server.js`);
@@ -468,7 +514,7 @@ server.on("error", (e) => {
 });
 
 const wantedPort = process.env.PORT === undefined || process.env.PORT === "" ? 3000 : Number(process.env.PORT);
-server.listen(wantedPort, "127.0.0.1", async () => {
+if (require.main === module) server.listen(wantedPort, "127.0.0.1", async () => {
   const port = server.address().port;
   await probeVersion();
   console.log(`Open Floor is running at http://localhost:${port}/`);
@@ -479,3 +525,5 @@ server.listen(wantedPort, "127.0.0.1", async () => {
     console.log("The `claude` program was not found. Install Claude Code and run `claude` once to sign in; the page will show an error until then.");
   }
 });
+
+module.exports = { hostOk, originOk }; // for tests
