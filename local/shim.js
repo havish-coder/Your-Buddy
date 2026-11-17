@@ -437,7 +437,8 @@
             if (typeof o.text === "string") text = o.text;
             dead = true;
             if (signal) signal.removeEventListener("abort", onAbort);
-            resolve({ text: text, truncated: false, modelTierApplied: tier });
+            if (o.refused) { reject({ code: "refused", message: "Claude declined to answer." }); return; }
+            resolve({ text: text, truncated: !!o.truncated, modelTierApplied: tier });
           } else if (o.error) {
             fail(CODES.indexOf(o.error.code) >= 0 ? o.error.code : "upstream_error", o.error.message);
           }

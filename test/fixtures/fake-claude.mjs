@@ -68,7 +68,7 @@ if (streamIn) {
 }
 log({ event: "prompt", prompt, images });
 
-const magic = /\[\[(slow|notloggedin|ratelimit|crash|garbage|stderrauth|hang|maxtokens|refusal)\]\]/.exec(prompt);
+const magic = /\[\[(slow|notloggedin|ratelimit|crash|garbage|stderrauth|hang|maxtokens|refusal|refusaltext)\]\]/.exec(prompt);
 const mode = magic ? magic[1] : envMode;
 
 const model = val("--model") || "default";
@@ -109,7 +109,7 @@ if (mode === "crash") {
   process.exit(3);
 }
 
-const stopReason = mode === "maxtokens" ? "max_tokens" : mode === "refusal" ? "refusal" : "end_turn"; // [[maxtokens]] [[refusal]]
+const stopReason = mode === "maxtokens" ? "max_tokens" : (mode === "refusal" || mode === "refusaltext") ? "refusal" : "end_turn"; // [[maxtokens]] [[refusal]] (no text) [[refusaltext]] (text, then a refusal)
 let parts;
 if (mode === "refusal") parts = [];
 else if (mode === "slow") parts = Array.from({ length: 60 }, (_, i) => `word${i} `);

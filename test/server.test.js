@@ -616,6 +616,34 @@ test("max_tokens gives truncated: true; a refusal with no text gives refused", a
   } finally { await srv.stop(); }
 });
 
+test("a refusal that already streamed text is done with refused: true", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  try {
+    const r = await ask(srv.port, { messages: [U("[[refusaltext]] hello")] });
+    const l = lastLine(r);
+    assert.strictEqual(l.done, true);
+    assert.strictEqual(l.refused, true);
+    assert.ok(l.text.length > 0);
+  } finally { await srv.stop(); }
+});
+
+test("deleting the working folder between asks: the next ask still works, in a new private folder", async () => {
+  const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
+  let cwd2;
+  try {
+    assert.strictEqual(lastLine(await ask(srv.port, { messages: [U("first")] })).done, true);
+    const cwd1 = srv.starts()[0].cwd;
+    fs.rmSync(cwd1, { recursive: true, force: true });
+    const r = await ask(srv.port, { messages: [U("second")] });
+    assert.strictEqual(lastLine(r).done, true, JSON.stringify(lastLine(r)));
+    cwd2 = srv.starts()[1].cwd;
+    assert.notStrictEqual(cwd2, cwd1);
+    assert.ok(path.basename(cwd2).startsWith("open-floor-"), cwd2);
+    if (process.platform !== "win32") assert.strictEqual(fs.statSync(cwd2).mode & 0o777, 0o700);
+  } finally { await srv.stop(); }
+  assert.strictEqual(fs.existsSync(cwd2), false, "the current folder is removed on exit");
+});
+
 test("SIGTERM during a slow ask ends the stream with an error line", async () => {
   const srv = await startServer({ OPEN_FLOOR_PRESTART: "0" });
   const p = ask(srv.port, { messages: [U("[[slow]] hello")] });

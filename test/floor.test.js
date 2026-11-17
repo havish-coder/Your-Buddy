@@ -2584,6 +2584,7 @@ test("S1 speakers: words heard while Claude speaks are dropped and Claude keeps 
 test("S2 speakers: the same words inside the tail after the voice stops are dropped; Claude does not answer them", async () => {
   const t = dup();
   await dupSpeaking(t);
+  t.voice.position(0, 0, t.voice.calls[0].lines[0].id); // the reply became audible
   t.voice.finishAll();
   await flush();
   await t.clock.advance(300);
@@ -2614,6 +2615,7 @@ test("S4 speakers: a phrase whose partials began during speech and whose final l
   const t = dup();
   await dupSpeaking(t);
   t.mic.partial("tides come");
+  t.voice.position(0, 0, t.voice.calls[0].lines[0].id); // the reply became audible
   t.voice.finishAll();
   await flush();
   await t.clock.advance(1000);
@@ -3249,4 +3251,88 @@ test("L18 a pending image is not sent with a monitor step, and is sent with the 
   t.eng.submitText("please answer");
   await flush();
   assert.deepStrictEqual(t.model.last().opts.images, [blob]);
+});
+
+// ---------------------------------------------------------- review 3 fixes
+test("R3.1 speakers: echo partial dropped, then Space: the user's first phrase is heard, the echo words are not", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.mic.partial("tides come from the moon");  // echo, dropped; no final yet
+  t.eng.takeFloor();
+  t.mic.partial("tides come from the moon and why");
+  t.mic.partial("tides come from the moon and why is that");
+  t.mic.final("tides come from the moon and why is that");
+  assert.strictEqual(t.eng.getInfo().utterance, "and why is that");
+  await t.clock.advance(600);
+  assert.strictEqual(t.model.calls.length, 2, "a reply is asked for");
+  assert.match(t.model.last().last, /and why is that/);
+  // a final made only of the echo words is dropped
+  const u = dup();
+  await dupSpeaking(u);
+  u.mic.partial("tides come from");
+  u.eng.takeFloor();
+  u.mic.final("tides come from the");
+  assert.strictEqual(u.eng.getInfo().utterance, "");
+});
+
+test("R3.2 speakers: an echo partial with no final does not swallow the next phrase once the window has passed", async () => {
+  const t = dup();
+  await dupSpeaking(t);
+  t.voice.position(0, 0, t.voice.calls[0].lines[0].id);
+  t.mic.partial("the moon and");
+  t.voice.finishAll();
+  await flush();
+  await t.clock.advance(1000);
+  t.mic.partial("the moon and the"); // still in the tail: dropped
+  await t.clock.advance(1000);       // past the tail
+  t.mic.partial("so what about waves");
+  t.mic.final("so what about waves");
+  assert.strictEqual(t.eng.getInfo().utterance, "so what about waves");
+  await t.clock.advance(600);
+  assert.strictEqual(t.model.calls.length, 2);
+});
+
+test("R3.3 a reply cut off before any audio leaves no deaf tail", async () => {
+  const t = dup();
+  await dupSpeaking(t);                 // no position/state event: nothing was audible
+  t.eng.takeFloor();
+  t.mic.partial("wait a moment");
+  t.mic.final("wait a moment");
+  assert.strictEqual(t.eng.getInfo().utterance, "wait a moment");
+  // and a reply that finishes without ever being audible
+  const u = dup();
+  await dupSpeaking(u);
+  u.voice.finishAll();
+  await flush();
+  u.mic.partial("what about the sun");
+  u.mic.final("what about the sun");
+  assert.strictEqual(u.eng.getInfo().utterance, "what about the sun");
+});
+
+test("R3.4 abbreviations are not sentence ends; No. still is", async () => {
+  const t = await stepStream(["Dr. Smith is wrong about that. Why?"]);
+  assert.strictEqual(t.voice.spoken()[0], "Dr. Smith is wrong about that.");
+  assert.ok(!t.voice.spoken().includes("Dr."));
+  const u = await stepStream(["No. That's wrong."]);
+  assert.strictEqual(u.voice.spoken()[0], "No.");
+  const w = await stepStream(["Stop. The U.S. e.g. Fig. 3 is fine, etc. and so on. Why?"]);
+  assert.strictEqual(w.voice.spoken()[0], "Stop.");
+  assert.strictEqual(w.voice.spoken()[1], "The U.S. e.g. Fig. 3 is fine, etc. and so on. Why?");
+});
+
+test("R3.5 the listen and strict prompts say to wait on a narrowing and not to correct a fine simplification", async () => {
+  const t = lis({ cutInCooldownMs: 0 });
+  t.eng.takeFloor();
+  const modes = [];
+  for (let n = 8; n <= 24; n += 8) {
+    await t.clock.advance(1600);
+    feed(t, nw(n), n - 7);
+    const c = t.model.last();
+    modes.push(c.mode);
+    assert.match(c.last, /qualifying or narrowing what they just said/);
+    assert.match(c.last, /fine at the level they are speaking is not an error/);
+    c.resolve("<notes>ok</notes>");
+    await flush();
+  }
+  assert.deepStrictEqual(modes, ["listen", "listen", "strict"]);
 });

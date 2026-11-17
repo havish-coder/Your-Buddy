@@ -148,11 +148,20 @@
     return { wait: false, say: s.say.trim(), show: s.show.trim() };
   }
 
+  var ABBREV = /^(dr|mr|mrs|ms|prof|sr|jr|st|vs|etc|e\.g|i\.e|inc|ltd|approx|fig)$/i;
+  /** True when the full stop at `idx` ends an abbreviation or an initial ("Dr.", "e.g.", "U."), not a sentence. */
+  function abbrevDot(text, idx) {
+    if (text.charAt(idx) !== ".") return false;
+    var w = /[A-Za-z]+(?:\.[A-Za-z]+)*$/.exec(text.slice(0, idx));
+    return !!w && (ABBREV.test(w[0]) || /^[A-Z]$/.test(w[0]));
+  }
+
   /** End index (exclusive, closers included, whitespace excluded) of the first complete sentence, or -1. */
   function firstSentenceEnd(say) {
     var re = /[.!?…]["'”’)\]]*(?=\s)/g;
     var m;
     while ((m = re.exec(say))) {
+      if (abbrevDot(say, m.index)) continue;
       if (m.index + 1 >= 12) return m.index + m[0].length;
     }
     return -1;
@@ -165,7 +174,7 @@
     while (s.length > max) {
       var cut = -1, m, re;
       re = /[.!?…]["'”’)\]]*\s/g;
-      while ((m = re.exec(s)) && m.index + m[0].length <= max) cut = m.index + m[0].length;
+      while ((m = re.exec(s)) && m.index + m[0].length <= max) { if (!abbrevDot(s, m.index)) cut = m.index + m[0].length; }
       if (cut < max / 2) {
         var c2 = -1;
         re = /[,;:—–]\s/g;
@@ -263,7 +272,7 @@
     var promptTrimNoticed = false;
     // full duplex (config.duplex): echo filtering and barge-in
     var echoTail = null;      // {until}: speakers only; the mic is deaf until then (echoTailMs after the voice stops)
-    var dropState = null;     // speakers: {at, settled}: a phrase whose partial was dropped; its rest and final are dropped too
+    var dropState = null;     // speakers: {at, settled, text}: the latest dropped text of an open phrase; it becomes the phrase's accounted-for reference
     var speakersNoted = false; // the "speakers" ignored decision was already emitted for this deaf window
     var pf = null;            // per-phrase references: {committed, frozen, at}
     var graceCarry = [];      // words said during a cut-in's grace period, carried into a barge-in utterance
@@ -466,6 +475,8 @@
               "if where it is heading is already clear and wrong. A person lets one doubtful remark pass and notes it, " +
               "then stops the speaker when they double down or build on it: use your notes that way. A remark the speaker has " +
               "since narrowed or backed up is no longer wrong. ") +
+          "If the speaker is in the middle of qualifying or narrowing what they just said (\"but I mean\", \"except\", \"well, only\"), wait for the next check before judging it. " +
+          "A simplification that is fine at the level they are speaking is not an error, so do not cut in to add precision or detail. " +
           "If you cut in, do not write <notes>: start with a one-to-three-word stopper as its own sentence (\"Stop.\", " +
           "\"No, wait.\", \"Hold on.\"), then say what is wrong, give one concrete example or counter-fact, and end by putting a " +
           "question back to them. Four sentences at most.";
@@ -671,7 +682,9 @@
 
     /** End of the first sentence with no minimum length (a stopper like "Stop." counts), or -1. */
     function stopperEnd(say, ended) {
-      var m = /[.!?\u2026]["'\u201d\u2019)\]]*(?=\s|$)/.exec(say);
+      var re = /[.!?\u2026]["'\u201d\u2019)\]]*(?=\s|$)/g;
+      var m;
+      while ((m = re.exec(say)) && abbrevDot(say, m.index)) { /* an abbreviation, not a sentence end */ }
       if (!m) return -1;
       var e = m.index + m[0].length;
       if (e < say.length || ended) return e;
@@ -1225,8 +1238,25 @@
       return pf;
     }
 
+    /** The dropped text of an open phrase becomes that phrase's already-accounted reference (the committed-phrase mechanism). */
+    function convertDrop(withReply) {
+      var ds = dropState;
+      dropState = null;
+      if (!ds || !ds.text) return;
+      var keys = keySeq([ds.text]);
+      var frozen = null;
+      if (withReply) {
+        // The window passed while the guess kept growing: if the dropped words come from Claude's last reply, the whole reply is the echo.
+        var last = null;
+        for (var i = history.length - 1; i >= 0 && !last; i--) if (history[i].role === "assistant") last = history[i];
+        var rk = last ? keySeq([last.text]) : [];
+        if (keys.length && keys.every(function (k) { return rk.indexOf(k) >= 0; })) frozen = [rk];
+      }
+      pf = { committed: keys, frozen: frozen, at: now() };
+    }
+
     function noteEchoTail(rs) {
-      if (!config.duplex || config.echoGuard === false || !rs || !rs.lines.length) return;
+      if (!config.duplex || config.echoGuard === false || !rs || !rs.lines.length || !rs.audible) return;
       echoTail = { until: now() + Number(config.echoTailMs || 0) };
     }
 
@@ -1351,16 +1381,18 @@
       if (config.echoGuard !== false) {
         // Speakers: deaf while Claude thinks or speaks and for echoTailMs after; a phrase begun in that window stays dropped.
         var deaf = ((state === "thinking" || state === "speaking") && micOpen()) || (echoTail && now() < echoTail.until);
-        var ds = dropState && now() - dropState.at <= Number(config.phraseFilterMs || 0) ? dropState : null;
-        if (ds && kind === "partial" && ds.settled) ds = null; // a new phrase after the old one settled
-        dropState = ds;
-        if (deaf || ds) {
+        if (deaf) {
           if (!speakersNoted) {
             speakersNoted = true;
             emit({ type: "decision", kind: "bargeIn", result: "ignored", ms: 0, detail: "speakers" });
           }
-          dropState = kind === "final" ? null : { at: now(), settled: false };
+          dropState = kind === "final" ? null : { at: now(), settled: false, text: raw }; // the latest dropped text of the open phrase
           return null;
+        }
+        // The deaf window is over: never drop (or renew) again. An open dropped phrase becomes the reference.
+        if (dropState) {
+          if (dropState.settled && (kind === "partial" || now() - dropState.at > Number(config.phraseFilterMs || 0))) dropState = null; // a new phrase
+          else convertDrop(true);
         }
         speakersNoted = false;
       }
@@ -1581,6 +1613,7 @@
       clearTimers();
       cutOffReply();
       echoTail = null; // the user took the floor on purpose: their next words are heard
+      if (dropState) convertDrop(); // an echo phrase still open: its words are already accounted for
       // Must stay synchronous: the platform only allows the mic to start inside the gesture.
       if (!open || micStopping) startMic();
       setState("listening");

@@ -264,6 +264,17 @@ await check("11 first run: the headphones prompt appears once and each button wo
   noErrors(p3); await p3.__ctx.close();
 });
 
+await check("12 the shim passes truncated through, and the empty-state line follows the headphones setting", async () => {
+  const page = await newPage();
+  const r = await page.evaluate(async () => { const sample = await window.claude.use("sample"); return sample("[[maxtokens]] hello", {}); });
+  assert(r.truncated === true && r.text.length > 0, "truncated flag lost: " + JSON.stringify(r));
+  await page.click("#hpNo");
+  assert((await page.locator("#emptyThird").innerText()) === "Press Space to take the floor back.", "speakers line");
+  await page.check("#setHeadphones");
+  assert((await page.locator("#emptyThird").innerText()) === "Talk over Claude to take the floor back, or press Space.", "headphones line");
+  noErrors(page); await page.__ctx.close();
+});
+
 await check("10 screenshots of the local page in light and dark", async () => {
   for (const scheme of ["light", "dark"]) {
     const page = await newPage({ scheme, msPerChar: 200 });

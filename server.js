@@ -31,7 +31,15 @@ const MAX_BODY = 12 * 1024 * 1024;
 const MAX_ASKS = Math.max(1, Math.floor(Number(process.env.OPEN_FLOOR_MAX_ASKS)) || 3);
 // One private (mode 0700) working folder for every child, so no other local user can plant
 // .claude/settings.json or CLAUDE.md where Claude Code reads them. Removed on exit.
-const WORKDIR = fs.mkdtempSync(path.join(os.tmpdir(), "open-floor-"));
+let WORKDIR = fs.mkdtempSync(path.join(os.tmpdir(), "open-floor-"));
+// A temp cleaner may delete the folder while the server runs: make a fresh private one (never mkdirSync on the old name).
+function ensureWorkdir() {
+  if (fs.existsSync(WORKDIR)) return;
+  try { WORKDIR = fs.mkdtempSync(path.join(os.tmpdir(), "open-floor-")); }
+  catch (e) { const w = new Error("cannot create the private working folder: " + e.message); w.code = "EWORKDIR"; throw w; }
+}
+// ENOENT means "program not found" only while the working folder is there; a missing folder is not that.
+const programMissing = (e) => !!e && e.code === "ENOENT" && fs.existsSync(WORKDIR);
 const TIERS = { quick: "haiku", default: "sonnet", complex: "opus" };
 const SYSTEM_PROMPT = "You are Claude. Follow the instructions in the user's message exactly.";
 
@@ -59,6 +67,7 @@ function winQuote(a) { return a === "" || /[\s&|<>^()"]/.test(a) ? '"' + a + '"'
 
 // Every argument comes from constants in this file, never from a request. The prompt goes through stdin.
 function spawnClaude(args) {
+  ensureWorkdir();
   const opts = { cwd: WORKDIR, stdio: ["pipe", "pipe", "pipe"], windowsHide: true };
   if (/\.(mjs|cjs|js)$/i.test(BIN)) return spawn(process.execPath, [BIN, ...args], opts);
   if (IS_WIN && !/\.exe$/i.test(BIN)) {
@@ -198,7 +207,7 @@ function fill(alias) {
   pool.set(alias, run);
   if (run.spawnError) {
     pool.delete(alias);
-    if (run.spawnError.code === "ENOENT") state.found = false;
+    if (programMissing(run.spawnError)) state.found = false;
     return;
   }
   run.idleTimer = setTimeout(() => {
@@ -296,6 +305,7 @@ function runAsk({ alias, prompt, images }, cb) {
             const reason = stopReason || j.stop_reason;
             const final = text || (typeof j.result === "string" ? j.result : "");
             if (reason === "refusal" && !final.trim()) fail("refused", "the model refused");
+            else if (reason === "refusal") succeed(final, { refused: true });
             else if (reason === "max_tokens") succeed(final, { truncated: true });
             else succeed(final);
           }
@@ -304,7 +314,7 @@ function runAsk({ alias, prompt, images }, cb) {
       exit(info) {
         if (finished || cancelled) return;
         const err = (run.stderr + "\n" + run.junk).trim();
-        if (run.spawnError && run.spawnError.code === "ENOENT") { state.found = false; return fail("sampling_disabled", String(run.spawnError)); }
+        if (run.spawnError && programMissing(run.spawnError)) { state.found = false; return fail("sampling_disabled", String(run.spawnError)); }
         const rej = rejectedRequiredFlag(run.stderr);
         if (rej) return fail("upstream_error", "this claude rejected required flag " + rej + "; refusing to run without it. " + err);
         if (dropUnknownFlag(run.stderr) && !retried) { retried = true; return start(); }
