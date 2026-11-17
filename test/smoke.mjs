@@ -737,6 +737,50 @@ await check("26 listen mode: no reply after a pause; Your take asks for one", as
   assert((await kinds(page)).includes("forced"), "Your take did not make a forced ask");
   noErrors(page); await page.__ctx.close();
 });
+await check("27b reply-after-silence setting: default, persistence, reaches the engine", async () => {
+  let page = await newPage();
+  assert((await page.inputValue("#setPause")) === "0.5", "default not 0.5");
+  assert((await page.locator("#setPauseVal").innerText()) === "0.5 s", "label");
+  assert(/How long you stay quiet before Claude answers/.test(await page.locator("#pauseHelp").innerText()), "help note");
+  // default 0.5 s: a short utterance gets a paused ask well before 1.5 s
+  await page.click("#floor");
+  await waitFor(page, () => window.__fake.dictationStarts === 1);
+  await fake(page, () => window.__fake.say.final("am I audible to you"));
+  await waitFor(page, () => window.__fake.calls.some((c) => c.kind === "paused"), null, 1400);
+  await page.__ctx.close();
+  // 3 s: no ask after 1.5 s; the setting persists across a reload
+  page = await newPage();
+  await page.locator("#setPause").evaluate((el) => { el.value = "3"; el.dispatchEvent(new Event("input", { bubbles: true })); });
+  assert((await page.locator("#setPauseVal").innerText()) === "3 s", "label after change");
+  await page.reload();
+  await page.waitForFunction(() => document.getElementById("noteConnecting").hidden === true, null, { timeout: 8000 });
+  assert((await page.inputValue("#setPause")) === "3", "pause not remembered");
+  await page.click("#floor");
+  await waitFor(page, () => window.__fake.dictationStarts === 1);
+  await fake(page, () => window.__fake.say.final("am I audible to you"));
+  await page.waitForTimeout(1500);
+  assert(!(await fake(page, () => window.__fake.calls.some((c) => c.kind === "paused"))), "asked before the longer pause");
+  noErrors(page); await page.__ctx.close();
+});
+await check("27c listen mode: a one-time note appears after the first quiet monitor step", async () => {
+  const page = await newPage();
+  await page.selectOption("#setMode", "listen");
+  assert(/checks whether to answer/.test(await page.locator("#pauseHelp").innerText()), "listen help note");
+  assert(await page.locator("#listenNote").isHidden(), "note visible too early");
+  await page.click("#floor");
+  await waitFor(page, () => window.__fake.dictationStarts === 1);
+  await fake(page, () => window.__fake.say.final("just a short statement here"));
+  await waitFor(page, () => !document.getElementById("listenNote").hidden, null, 8000);
+  assert(/^Listen and correct mode: Claude only speaks when you're wrong/.test(await page.locator("#listenNoteText").innerText()), "note text");
+  await page.click("#listenNoteX");
+  assert(await page.locator("#listenNote").isHidden(), "not dismissed");
+  const n = await fake(page, () => window.__fake.calls.filter((c) => c.kind === "monitor").length);
+  await fake(page, () => window.__fake.say.final("and another statement follows"));
+  await waitFor(page, (k) => window.__fake.calls.filter((c) => c.kind === "monitor").length > k, n, 8000);
+  await page.waitForTimeout(300);
+  assert(await page.locator("#listenNote").isHidden(), "note came back");
+  noErrors(page); await page.__ctx.close();
+});
 await check("27 each new setting reaches the engine", async () => {
   // listen every
   let page = await newPage();

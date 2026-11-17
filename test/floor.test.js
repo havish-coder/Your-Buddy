@@ -176,7 +176,7 @@ test("parseReply: wait, speech, show, truncation and partial prefixes", () => {
   assert.strictEqual(classifyReply("<wait>x"), "wait");
   assert.strictEqual(classifyReply("<w"+"hat"), "speech");
   assert.strictEqual(classifyReply("No."), "speech");
-  assert.strictEqual(DEFAULTS.pauseMs, 1500);
+  assert.strictEqual(DEFAULTS.pauseMs, 500);
 });
 
 // -------------------------------------------------------------- 1. pause -> reply
@@ -246,6 +246,61 @@ test("2. a mid-thought pause returns <wait>; after forceReplyMs a forced ask run
   await flush();
   assert.strictEqual(t.voice.calls.length >= 1, true);
   assert.deepStrictEqual(t.decisions(), ["reply:wait", "forced:speak"]);
+});
+
+test("2c. with the defaults, five words then 500 ms of silence asks and the reply is spoken", async () => {
+  const t = setup({ pauseMs: DEFAULTS.pauseMs, forceReplyMs: DEFAULTS.forceReplyMs });
+  t.eng.takeFloor();
+  t.mic.final("am I audible to you");
+  await t.clock.advance(499);
+  assert.strictEqual(t.model.calls.length, 0);
+  await t.clock.advance(1);
+  assert.strictEqual(t.model.calls.length, 1);
+  assert.strictEqual(t.model.calls[0].mode, "paused");
+  t.model.calls[0].resolve("Yes, loud and clear.");
+  await flush();
+  assert.strictEqual(t.voice.calls[0].lines[0].text, "Yes, loud and clear.");
+  assert.strictEqual(t.eng.getState(), "speaking");
+});
+
+test("2d. with the defaults, speech resuming at 400 ms starts no ask", async () => {
+  const t = setup({ pauseMs: DEFAULTS.pauseMs, forceReplyMs: DEFAULTS.forceReplyMs });
+  t.eng.takeFloor();
+  t.mic.final("am I audible");
+  await t.clock.advance(400);
+  t.mic.final(" to you");
+  await t.clock.advance(400);
+  assert.strictEqual(t.model.calls.length, 0);
+  await t.clock.advance(100);
+  assert.strictEqual(t.model.calls.length, 1);
+});
+
+test("2e. with the defaults, a <wait> answer is followed by a forced ask at 2000 ms", async () => {
+  const t = setup({ pauseMs: DEFAULTS.pauseMs, forceReplyMs: DEFAULTS.forceReplyMs });
+  t.eng.takeFloor();
+  t.mic.final("so what I really mean is");
+  await t.clock.advance(500);
+  t.model.calls[0].resolve("<wait>");
+  await flush();
+  await t.clock.advance(1499);
+  assert.strictEqual(t.model.calls.length, 1);
+  await t.clock.advance(1);
+  assert.strictEqual(t.model.calls.length, 2);
+  assert.strictEqual(t.model.calls[1].mode, "forced");
+});
+
+test("2f. speech resuming while the paused ask is in flight drops the ask", async () => {
+  const t = setup({ pauseMs: DEFAULTS.pauseMs, forceReplyMs: DEFAULTS.forceReplyMs });
+  t.eng.takeFloor();
+  t.mic.final("am I audible to you");
+  await t.clock.advance(500);
+  assert.strictEqual(t.model.calls.length, 1);
+  t.mic.final(" and can you hear me");
+  await flush();
+  t.model.calls[0].resolve("Yes.");
+  await flush();
+  assert.strictEqual(t.voice.calls.length, 0, "stale answer not spoken");
+  assert.strictEqual(t.eng.getState(), "listening");
 });
 
 test("2b. resuming after a wait cancels the forced ask timer and starts a fresh pause", async () => {
@@ -3138,8 +3193,8 @@ test("L13 defaults of the rework", () => {
   assert.strictEqual(DEFAULTS.listenMinGapMs, 1500);
   assert.strictEqual(DEFAULTS.strictEveryWords, 20);
   assert.strictEqual(DEFAULTS.cutInCooldownMs, 5000);
-  assert.strictEqual(DEFAULTS.pauseMs, 1500);
-  assert.strictEqual(DEFAULTS.forceReplyMs, 3500);
+  assert.strictEqual(DEFAULTS.pauseMs, 500);
+  assert.strictEqual(DEFAULTS.forceReplyMs, 2000);
   assert.strictEqual(DEFAULTS.minWordsForCutIn, undefined);
   assert.strictEqual(DEFAULTS.cutInMinGapMs, undefined);
 });

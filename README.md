@@ -42,7 +42,7 @@ On the first run the page asks whether you are using headphones. You can change 
 
 ## Settings
 
-The page keeps its settings (such as voice, speed and the headphones option) in your browser. The server has a few options set through environment variables:
+The page keeps its settings (such as voice, speed and the headphones option) in your browser. Among them, **Reply after silence** (0.5 to 3 seconds, default 0.5) sets how long you stay quiet before Claude answers. The server has a few options set through environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
