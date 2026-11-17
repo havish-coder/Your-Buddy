@@ -66,6 +66,15 @@ The server refuses any request whose Host or Origin is not `localhost` or `127.0
 
 **Claude does not hear me, or the page says the microphone is blocked.** Check that Chrome has permission for the microphone (lock icon in the address bar) and that the right input device is selected in your system settings. Speech recognition needs an internet connection.
 
+**Microphone on Windows.** The page now tells you the exact cause when the microphone does not start. The usual fixes:
+
+1. Use Google Chrome and open exactly `http://localhost:3000/` (other browsers may not support speech recognition).
+2. In Chrome: click the icon left of the address bar, choose Site settings, set Microphone to Allow, then press Try again.
+3. In Windows: open Settings, Privacy & security, Microphone. Turn on Microphone access and Let desktop apps access your microphone.
+4. Another app may be holding the microphone (Teams, Zoom, Discord). Close it and try again.
+
+"Not secure" in the address bar is normal for `http://localhost` and is not the problem.
+
 **Claude answers itself, or cuts itself off.** The page thinks you are on headphones while you are using speakers. Untick **I'm using headphones** in the settings. On speakers, Claude ignores your voice while it speaks, so press Space to interrupt.
 
 **"Port 3000 is already in use."** Another program is using the port. Start on another one: `PORT=3001 node server.js`, then open `http://localhost:3001`.

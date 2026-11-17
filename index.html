@@ -822,7 +822,7 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
       case "turnRemove": removeTurn(e.id); break;
       case "decision": logDecision(e); break;
       case "notice":
-        addNotice(noticeText(e.code, e.detail), e.code);
+        if (!(LOCAL && showMicHelp(e.code))) addNotice(noticeText(e.code, e.detail), e.code);
         if (e.code === "model_unavailable") { modelOff = true; $("bannerModelOff").textContent = noticeText(e.code, e.detail); syncCaps(); }
         if (e.code === "mic_denied" || e.code === "mic_unavailable") { caps.d = null; syncCaps(); }
         break;
@@ -878,6 +878,62 @@ details#debug summary { cursor: pointer; font-size: var(--fs-s); font-weight: 60
     setTimeout: function (fn, ms) { return window.setTimeout(fn, ms); },
     clearTimeout: function (id) { window.clearTimeout(id); }
   };
+
+  /* ---------- local mode only: microphone help box and browser notes ---------- */
+  function micHelpSteps(p) {
+    var port = location.port || "3000";
+    var site = "Chrome has blocked the microphone for this page. Click the icon to the left of the address bar, choose Site settings, set Microphone to Allow, then press Try again.";
+    if (p.cause === "blocked" && p.detail === "site") return { h: "Microphone blocked in Chrome", t: [site] };
+    if (p.cause === "blocked") return { h: "Your computer is blocking the microphone", t: [
+      "Your computer is not letting the browser use the microphone. On Windows: open Settings, Privacy & security, Microphone. Turn on Microphone access and Let desktop apps access your microphone. Then press Try again.",
+      "If Chrome showed a prompt and you clicked Block, use the steps for Chrome instead: the icon left of the address bar, Site settings, Microphone, Allow."] };
+    if (p.cause === "browser") return { h: "Speech recognition is not available in this browser", t: ["This browser can't do speech recognition here. Open http://localhost:" + port + "/ in Google Chrome."] };
+    if (p.cause === "insecure") return { h: "Open the page at the localhost address", t: ["The microphone only works at http://localhost:" + port + "/. Open that exact address in Google Chrome."] };
+    if (p.cause === "no_device") {
+      var nd = { h: "No microphone found", t: ["No microphone was found. Plug one in, or check it is enabled in Windows Sound settings, then press Try again."] };
+      if (p.detail === "capture") nd.t.push("Check that Chrome is using the right microphone: open chrome://settings/content/microphone and pick your microphone in the list at the top. In Windows, check Settings, System, Sound, Input.");
+      return nd;
+    }
+    if (p.cause === "busy") return { h: "The microphone is in use", t: ["Another app is using the microphone. Close Teams, Zoom, Discord or any other app using it, then press Try again."] };
+    if (p.cause === "network") return { h: "No internet connection", t: [
+      "Chrome's speech recognition needs an internet connection. Check you are online, then press Try again.",
+      "Chrome sends speech to Google to recognise it. A VPN, proxy, firewall or antivirus can block that. To check, open google.com and click the microphone in the search box: if that fails too, the problem is Chrome's connection, not this page."] };
+    if (p.cause === "stops") return { h: "Chrome keeps stopping speech recognition", t: ["Chrome keeps stopping speech recognition right after it starts. Check the microphone chosen in chrome://settings/content/microphone and in Windows Settings, System, Sound, Input, and try the google.com microphone test.", "Then press Try again."] };
+    if (p.cause === "other") return { h: "The microphone stopped", t: ["Speech recognition stopped with an error. Press Try again. If it keeps happening, send the details below."] };
+    return null;
+  }
+  function showMicHelp(code) {
+    if (code !== "mic_denied" && code !== "mic_unavailable" && code !== "mic_error") return false;
+    var info = LOCAL.micProblem && micHelpSteps(LOCAL.micProblem);
+    if (!info) return false;
+    var box = $("micHelp");
+    if (!box) { box = el("div", "banner"); box.id = "micHelp"; box.setAttribute("role", "alert"); $("notes").appendChild(box); }
+    box.textContent = "";
+    var h = el("strong"); h.textContent = info.h; box.appendChild(h);
+    info.t.forEach(function (line) { var q = el("p"); q.style.margin = "6px 0 0"; q.textContent = line; box.appendChild(q); });
+    var pr = LOCAL.micProblem, bits = [];
+    if (pr.code) bits.push("recognition error " + pr.code);
+    if (pr.cause === "stops" || pr.restarts) bits.push(pr.restarts + " quick restarts");
+    if (pr.lastSessionMs != null) bits.push("last session " + pr.lastSessionMs + " ms");
+    if (!bits.length) bits.push("cause " + pr.cause + (pr.detail ? "/" + pr.detail : ""));
+    var dt = el("p", "note"); dt.id = "micHelpDetails"; dt.style.margin = "8px 0 0"; dt.style.padding = "0"; dt.style.border = "0"; dt.style.background = "none"; dt.style.fontSize = "var(--fs-s)"; dt.textContent = "Details: " + bits.join(", ");
+    var b = el("button", "btn"); b.type = "button"; b.id = "micHelpRetry"; b.textContent = "Try again"; b.style.marginTop = "8px";
+    b.addEventListener("click", function () { location.reload(); });
+    box.appendChild(b);
+    box.appendChild(dt);
+    box.hidden = false;
+    return true;
+  }
+  function localBrowserNotes() {
+    var ua = navigator.userAgent || "", brands = navigator.userAgentData && navigator.userAgentData.brands, chrome;
+    if (brands) chrome = brands.some(function (b) { return b.brand === "Google Chrome"; });
+    else chrome = /Chrome\//.test(ua) && !/Edg\/|OPR\/|Brave/.test(ua) && typeof navigator.brave === "undefined";
+    var notes = [];
+    if (!chrome) notes.push("For voice, open this page in Google Chrome. Other browsers may not allow speech recognition here.");
+    if (["localhost", "127.0.0.1", "[::1]"].indexOf(location.hostname) < 0) notes.push("Open http://localhost:" + (location.port || "3000") + "/ for the microphone to work.");
+    notes.forEach(function (t) { var n = el("div", "note", t); n.className = "note localBrowserNote"; $("notes").appendChild(n); });
+  }
+  if (LOCAL) { localBrowserNotes(); LOCAL.onMicLog = function (result, detail) { logDecision({ kind: "mic", result: result, detail: detail, ms: 0 }); }; }
 
   /* ---------- capability-dependent UI ---------- */
   function syncCaps() {

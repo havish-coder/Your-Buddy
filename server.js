@@ -528,6 +528,7 @@ if (require.main === module) server.listen(wantedPort, "127.0.0.1", async () => 
   const port = server.address().port;
   await probeVersion();
   console.log(`Open Floor is running at http://localhost:${port}/`);
+  console.log(`Open this address in Google Chrome: http://localhost:${port}/`);
   if (state.found) {
     console.log(`Claude Code ${state.version || ""} found.${PRESTART ? " Warming up..." : ""}`.replace("  ", " "));
     for (const m of BOOT_MODELS) fill(m);

@@ -35,6 +35,8 @@ function installFakes(opts) {
     start() {
       if (F.nextStartThrows) { F.nextStartThrows--; F.recStartThrows++; throw new Error("InvalidStateError"); }
       F.recStarts++; this.running = true;
+      if (F.endImmediately > 0) { F.endImmediately--; setTimeout(() => { this.dead = true; this.running = false; this.onend && this.onend({}); }, 5); return; }
+      if (F.recError) { const er = F.recError; setTimeout(() => { this.dead = true; this.running = false; this.onerror && this.onerror({ error: er }); this.onend && this.onend({}); }, 5); return; }
       setTimeout(() => { if (!this.dead && this.onstart) this.onstart({}); }, 5);
     }
     _end() { if (this.dead) return; this.dead = true; this.running = false; setTimeout(() => this.onend && this.onend({}), 5); }
@@ -42,6 +44,19 @@ function installFakes(opts) {
     abort() { this.dead = true; this.running = false; }
   }
   window.webkitSpeechRecognition = FakeRec;
+  // getUserMedia succeeds by default; tests set F.gumError / F.permState / F.recError
+  F.gumCalls = 0; F.gumActive = []; F.gumError = null; F.permState = null; F.recError = null; F.stoppedTracks = 0; F.endImmediately = 0;
+  try {
+    const md = navigator.mediaDevices;
+    if (md) md.getUserMedia = () => {
+      F.gumCalls++; F.gumActive.push(!!(navigator.userActivation && navigator.userActivation.isActive));
+      if (F.gumError) { const e = new Error("fake"); e.name = F.gumError; return Promise.reject(e); }
+      return Promise.resolve({ getTracks: () => [{ stop() { F.stoppedTracks++; } }] });
+    };
+    const origQuery = navigator.permissions && navigator.permissions.query.bind(navigator.permissions);
+    if (navigator.permissions) navigator.permissions.query = (d) => (F.permState && d.name === "microphone" ? Promise.resolve({ state: F.permState }) : origQuery(d));
+  } catch (e) { /* ignore */ }
+  if (opts.ua) { Object.defineProperty(navigator, "userAgentData", { value: undefined, configurable: true }); }
   const live = () => F.recs.filter((r) => r.running && !r.dead).pop();
   F.liveRecs = () => F.recs.filter((r) => r.running && !r.dead).length;
   F.say = {
@@ -80,14 +95,14 @@ function installFakes(opts) {
 const browser = await chromium.launch();
 const results = [];
 const record = (name, status, detail = "") => { results.push({ name, status, detail }); console.log(`${status.toUpperCase().padEnd(5)} ${name}${detail ? " :: " + detail : ""}`); };
-async function newPage({ width = 1280, height = 800, scheme = "light", msPerChar = 12, preset } = {}) {
-  const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: scheme, permissions: ["clipboard-read", "clipboard-write"] });
+async function newPage({ width = 1280, height = 800, scheme = "light", msPerChar = 12, preset, ua } = {}) {
+  const ctx = await browser.newContext({ viewport: { width, height }, colorScheme: scheme, ...(ua ? { userAgent: ua } : {}), permissions: ["clipboard-read", "clipboard-write"] });
   const page = await ctx.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push("console: " + m.text()); });
   await page.route(/fonts\.(googleapis|gstatic)\.com/, (r) => r.fulfill({ status: 200, contentType: "text/css", body: "" }));
-  await page.addInitScript(installFakes, { msPerChar });
+  await page.addInitScript(installFakes, { msPerChar, ua });
   if (preset) await (Array.isArray(preset) ? page.addInitScript(preset[0], preset[1]) : page.addInitScript(preset));
   await page.goto(BASE);
   await page.waitForFunction(() => document.getElementById("noteConnecting").hidden === true, null, { timeout: 8000 });
@@ -283,6 +298,102 @@ await check("10 screenshots of the local page in light and dark", async () => {
     await page.waitForTimeout(150);
     await page.screenshot({ path: path.join(SHOTS, `local-${scheme}-1280.png`) });
     noErrors(page); await page.__ctx.close();
+  }
+});
+
+const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const EDGE_UA = CHROME_UA + " Edg/126.0.0.0";
+const micCases = [
+  ["blocked/site", { gum: "NotAllowedError", perm: "denied" }, /Chrome has blocked the microphone for this page/],
+  ["blocked/system", { gum: "NotAllowedError", perm: "prompt" }, /not letting the browser use the microphone/],
+  ["browser", { rec: "service-not-allowed" }, /can't do speech recognition here/],
+  ["no_device", { gum: "NotFoundError" }, /No microphone was found/],
+  ["busy", { gum: "NotReadableError" }, /Another app is using the microphone/],
+  ["network", { rec: "network" }, /needs an internet connection/, /Details: recognition error network/],
+  ["audio-capture", { rec: "audio-capture" }, /No microphone was found[\s\S]*chrome:\/\/settings\/content\/microphone/, /Details: recognition error audio-capture/],
+  ["stops", { ends: 99 }, /keeps stopping speech recognition/, /Details: .*quick restarts/],
+  ["other", { rec: "bad-grammar" }, /Speech recognition stopped with an error/, /Details: recognition error bad-grammar/],
+];
+for (const [name, cfg, re, detailRe] of micCases) {
+  await check("13 mic help box: " + name + " shows its steps and Try again reloads", async () => {
+    const page = await newPage({ ua: CHROME_UA });
+    await fake(page, (c) => { const F = window.__fake; F.gumError = c.gum || null; F.permState = c.perm || null; F.recError = c.rec || null; F.endImmediately = c.ends || 0; window.__marker = 1; }, cfg);
+    await page.click("#floor");
+    await page.waitForSelector("#micHelp:not([hidden])", { timeout: 5000 });
+    const text = await page.locator("#micHelp").innerText();
+    assert(re.test(text), "help text: " + text);
+    assert(!(await page.locator("#notices .notice").count()), "generic notice shown as well");
+    if (detailRe) assert(detailRe.test(text), "details missing: " + text);
+    if (name === "network") assert(/google\.com and click the microphone/.test(text), "network extra steps missing");
+    if (name === "stops") assert((await page.locator("#log").textContent()).includes("restart"), "debug log has no mic rows");
+    if (name === "network") assert(/micerror/.test(await page.locator("#log").textContent()), "debug log has no mic error row");
+    if (name === "blocked/system") assert(/Settings, Privacy & security, Microphone/.test(text) && /clicked Block/.test(text), "system steps incomplete");
+    const mp = await page.evaluate(() => window.OPEN_FLOOR_LOCAL.micProblem);
+    assert(mp && mp.cause === (name === "audio-capture" ? "no_device" : name.split("/")[0]), "micProblem: " + JSON.stringify(mp));
+    await page.click("#micHelpRetry");
+    await page.waitForFunction(() => window.__marker === undefined, null, { timeout: 8000 });
+    noErrors(page); await page.__ctx.close();
+  });
+}
+
+await check("14 a successful getUserMedia works as before, inside the click, tracks stopped, checked once", async () => {
+  const page = await newPage({ ua: CHROME_UA });
+  await page.click("#floor");
+  await waitFor(page, () => window.__fake.recStarts === 1);
+  await listening(page);
+  const f = await fake(page, () => ({ calls: window.__fake.gumCalls, active: window.__fake.gumActive, stopped: window.__fake.stoppedTracks, mp: window.OPEN_FLOOR_LOCAL.micProblem }));
+  assert(f.calls === 1 && f.active[0] === true, "getUserMedia not called inside the click: " + JSON.stringify(f));
+  assert(f.stopped === 1 && f.mp === null, "tracks/micProblem: " + JSON.stringify(f));
+  assert(!(await page.locator("#micHelp").count()), "help box shown on success");
+  await page.evaluate(async () => { const d = await window.claude.use("dictation"); await d.stop(); await d.start(); });
+  assert((await fake(page, () => window.__fake.recStarts)) >= 2, "second start did not run");
+  assert((await fake(page, () => window.__fake.gumCalls)) === 1, "successful check was not cached");
+  noErrors(page); await page.__ctx.close();
+});
+
+await check("14b one end after a long session restarts quietly and listening continues", async () => {
+  const page = await newPage({ ua: CHROME_UA });
+  await page.click("#floor");
+  await listening(page);
+  await page.waitForTimeout(1300);
+  for (let i = 0; i < 7; i++) { // more than the limit, but each session was long enough not to count
+    await fake(page, () => window.__fake.chromeEndsSession());
+    await waitFor(page, (n) => window.__fake.recStarts >= n, i + 2, 3000);
+    await page.waitForTimeout(1050);
+  }
+  await listening(page);
+  assert(!(await page.locator("#micHelp").count()) && !(await page.locator("#notices .notice").count()), "an error was shown");
+  noErrors(page); await page.__ctx.close();
+});
+
+await check("15 a failed check is repeated on the next start", async () => {
+  const page = await newPage({ ua: CHROME_UA });
+  await fake(page, () => { window.__fake.gumError = "NotReadableError"; });
+  await page.click("#floor");
+  await page.waitForSelector("#micHelp:not([hidden])");
+  assert((await fake(page, () => window.__fake.gumCalls)) === 1, "calls");
+  noErrors(page); await page.__ctx.close();
+});
+
+await check("16 non-Chrome note: shown for Edge, not for Chrome", async () => {
+  const edge = await newPage({ ua: EDGE_UA });
+  assert(/open this page in Google Chrome/.test(await edge.locator("#notes").innerText()), "no note for Edge");
+  await edge.__ctx.close();
+  const chrome = await newPage({ ua: CHROME_UA });
+  assert(!/Google Chrome/.test(await chrome.locator("#notes").innerText()), "note shown for Chrome");
+  assert(!/Open http:\/\/localhost/.test(await chrome.locator("#notes").innerText()), "address note shown on 127.0.0.1");
+  await chrome.__ctx.close();
+});
+
+await check("17 screenshots of the help box (1280 light, 400 dark)", async () => {
+  for (const [scheme, width] of [["light", 1280], ["dark", 400]]) {
+    const page = await newPage({ scheme, width, height: 800, ua: CHROME_UA });
+    await fake(page, () => { window.__fake.gumError = "NotAllowedError"; window.__fake.permState = "prompt"; });
+    await page.click("#floor");
+    await page.waitForSelector("#micHelp:not([hidden])");
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), "horizontal scroll at " + width);
+    await page.screenshot({ path: path.join(SHOTS, `mic-help-${scheme}-${width}.png`) });
+    await page.__ctx.close();
   }
 });
 

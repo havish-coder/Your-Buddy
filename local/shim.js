@@ -5,7 +5,7 @@
 (function () {
   "use strict";
   var root = typeof window !== "undefined" ? window : globalThis;
-  root.OPEN_FLOOR_LOCAL = { duplex: true, maxRate: 2.5 };
+  root.OPEN_FLOOR_LOCAL = { duplex: true, maxRate: 2.5, micProblem: null, onMicLog: null };
 
   function emitter() {
     var list = [];
@@ -17,6 +17,38 @@
       emit: function (e) { list.slice().forEach(function (fn) { try { fn(e); } catch (err) { /* handler errors stay in the page */ } }); },
       list: list
     };
+  }
+
+  /* ------------------------------------------------------------------ microphone diagnosis */
+  var diag = { code: null, restarts: 0, lastSessionMs: null }; // what recognition last did, for the help box
+  function setMicProblem(cause, detail) {
+    root.OPEN_FLOOR_LOCAL.micProblem = cause ? { cause: cause, detail: detail || null, code: diag.code, restarts: diag.restarts, lastSessionMs: diag.lastSessionMs } : null;
+  }
+  function micLog(result, detail) { try { if (root.OPEN_FLOOR_LOCAL.onMicLog) root.OPEN_FLOOR_LOCAL.onMicLog(result, detail); } catch (e) { /* log only */ } }
+  // Maps a getUserMedia failure to a cause, then calls done(code). Reads the permission state only when it helps.
+  function diagnoseGum(err, done) {
+    var n = (err && err.name) || "";
+    if (n === "NotFoundError" || n === "DevicesNotFoundError" || n === "OverconstrainedError") { setMicProblem("no_device"); done("unavailable"); return; }
+    if (n === "NotReadableError" || n === "TrackStartError" || n === "AbortError") { setMicProblem("busy"); done("upstream_error"); return; }
+    var finish = function (state) { setMicProblem("blocked", state === "denied" ? "site" : "system"); done("not_granted"); };
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        navigator.permissions.query({ name: "microphone" }).then(function (r) { finish(r && r.state); }, function () { finish(null); });
+        return;
+      }
+    } catch (e) { /* fall through */ }
+    finish(null);
+  }
+  // Called synchronously inside the user's gesture. done(null) means the microphone works.
+  function checkMic(done) {
+    var md = navigator.mediaDevices;
+    if (!md || !md.getUserMedia || root.isSecureContext === false) { setMicProblem("insecure"); done("not_granted"); return; }
+    var p;
+    try { p = md.getUserMedia({ audio: true }); } catch (e) { diagnoseGum(e, done); return; }
+    p.then(function (stream) {
+      try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* ignore */ }
+      done(null);
+    }, function (err) { diagnoseGum(err, done); });
   }
 
   /* ------------------------------------------------------------------ dictation */
@@ -31,6 +63,8 @@
     var hadFinal = false;
     var interim = "";
     var fatal = null;
+    var micOk = false;           // getUserMedia worked once on this page load
+    var startToken = 0;
     var stopTimer = null;
     var pe = emitter(), fe = emitter(), se = emitter();
 
@@ -75,9 +109,11 @@
       r.continuous = true;
       r.interimResults = true;
       try { r.lang = navigator.language || "en-US"; } catch (e) { /* ignore */ }
+      var began = 0;
       r.onstart = function () {
         if (rec !== r) return;
-        if (state === "starting") { setState("listening"); settle(true); }
+        began = Date.now();
+        if (state === "starting") { setMicProblem(null); setState("listening"); settle(true); }
       };
       r.onresult = function (ev) {
         if (rec !== r) return;
@@ -94,10 +130,16 @@
       r.onerror = function (ev) {
         if (rec !== r) return;
         var code = ev && ev.error;
+        diag.code = code || "unknown";
+        if (began) diag.lastSessionMs = Date.now() - began;
+        micLog("error", "recognition error " + diag.code);
         if (code === "no-speech" || code === "aborted") return;
-        if (code === "not-allowed" || code === "service-not-allowed") fatal = "not_granted";
-        else if (code === "language-not-supported") fatal = "unavailable";
-        else fatal = "upstream_error";
+        if (code === "service-not-allowed") { setMicProblem("browser"); fatal = "not_granted"; }
+        else if (code === "not-allowed") { setMicProblem("blocked", "site"); fatal = "not_granted"; }
+        else if (code === "language-not-supported") { setMicProblem("other"); fatal = "unavailable"; }
+        else if (code === "audio-capture") { setMicProblem("no_device", "capture"); fatal = "unavailable"; }
+        else if (code === "network") { setMicProblem("network"); fatal = "upstream_error"; }
+        else { setMicProblem("other"); fatal = "upstream_error"; }
         finalize(fatal);
       };
       r.onend = function () {
@@ -106,15 +148,26 @@
         if (!wanted) { finalize("stopped"); return; }
         // Chrome ended the session on its own (silence, time limit): restart quietly, stay "listening".
         var now = Date.now();
+        var ran = began ? now - began : 0;
+        diag.lastSessionMs = ran;
         restarts = restarts.filter(function (t) { return now - t < 10000; });
-        restarts.push(now);
-        if (restarts.length > 5) { finalize("upstream_error"); return; }
+        if (ran < 1000) restarts.push(now); // only sessions that ended almost at once count toward the limit
+        diag.restarts = restarts.length;
+        micLog("restart", "session ended after " + ran + " ms");
+        if (restarts.length > 5) { setMicProblem("stops"); finalize("upstream_error"); return; }
         if (interim) { interim = ""; pe.emit({ text: "" }); }
         rec = null;
-        setTimeout(function () {
+        var tries = 0;
+        var again = function () {
           if (!wanted || stopping || rec) return;
-          try { spawn(); } catch (e) { finalize("upstream_error"); }
-        }, 0);
+          try { spawn(); }
+          catch (e) {
+            if (tries++ < 1 && e && e.name === "InvalidStateError") { setTimeout(again, 500); return; }
+            diag.code = (e && e.name) || "start_failed"; micLog("error", "restart failed " + diag.code);
+            setMicProblem("other"); finalize("upstream_error");
+          }
+        };
+        setTimeout(again, 250); // Chrome on Windows can refuse a start() that follows onend too quickly
       };
       r.start(); // may throw InvalidStateError; the caller handles it
     }
@@ -128,11 +181,23 @@
           if (state === "listening") return Promise.resolve();
           return new Promise(function (res, rej) { waiters.push({ res: res, rej: rej }); });
         }
-        wanted = true; stopping = false; restarts = []; fatal = null;
+        wanted = true; stopping = false; restarts = []; fatal = null; diag = { code: null, restarts: 0, lastSessionMs: null };
         setState("starting");
         var p = new Promise(function (res, rej) { waiters.push({ res: res, rej: rej }); });
-        try { spawn(); } // synchronous: Chrome ties the first start to the user's click
-        catch (e) { finalize("upstream_error"); }
+        var launch = function () {
+          try {
+            if (!SR) { setMicProblem("browser"); finalize("not_granted"); return; }
+            spawn();
+          } catch (e) { finalize("upstream_error"); }
+        };
+        if (micOk) { launch(); return p; }
+        var token = ++startToken;
+        checkMic(function (code) { // getUserMedia is called synchronously, inside the click
+          if (token !== startToken || !wanted || state !== "starting") return; // stopped meanwhile
+          if (code) { finalize(code); return; }
+          micOk = true;
+          launch();
+        });
         return p;
       },
       stop: function () {
@@ -480,7 +545,7 @@
       try {
         if (name === "dictation") {
           var SR = root.webkitSpeechRecognition || root.SpeechRecognition;
-          if (!SR) return Promise.resolve(null);
+          if (!SR && !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) return Promise.resolve(null);
           return Promise.resolve(cache.d || (cache.d = makeDictation(SR)));
         }
         if (name === "tts") {
