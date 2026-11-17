@@ -1,6 +1,6 @@
 # Open Floor
 
-Open Floor is a page for talking with Claude out loud. You speak, Claude answers in a spoken voice, and you can interrupt it by simply talking over it, the way you would with a person. It follows turn-taking rules: it waits for you to finish, does not mistake "yeah" for an interruption, and stops when you say two real words or "stop".
+Open Floor is a page for talking with Claude out loud. You speak, Claude answers in a spoken voice, and you can interrupt it by simply talking over it, the way you would with a person. It follows turn-taking rules: it waits for you to finish, does not mistake "yeah" for an interruption, and stops when you say two real words or "stop". It is like talking to a person who can come with a prolonged discussion.
 
 This folder is the version that runs on your own computer. A small server (`server.js`) shows the page in your browser and passes your conversation to the Claude Code program (`claude`) that is already installed and signed in on your machine. No API key is involved, and nothing is stored on disk.
 
